@@ -19,6 +19,14 @@ pub enum AdapterConfig {
     Regex { file: String, pattern: String },
     /// No file: the version is the last tag.
     GitTag,
+    /// `Cargo.toml` `[package]` / `[workspace.package]` version, plus `Cargo.lock`.
+    Cargo { file: Option<String> },
+    /// `pyproject.toml` `[project]` or `[tool.poetry]` version.
+    Python { file: Option<String> },
+    /// `tauri.conf.json` top-level `version` (Tauri 2) or `package.version` (Tauri 1).
+    Tauri { file: Option<String> },
+    /// Android `build.gradle(.kts)`: `versionName`, and `versionCode` + 1 on every bump.
+    Android { file: Option<String> },
 }
 
 impl AdapterConfig {
@@ -28,6 +36,10 @@ impl AdapterConfig {
             AdapterConfig::PlainFile { .. } => "plain-file",
             AdapterConfig::Regex { .. } => "regex",
             AdapterConfig::GitTag => "git-tag",
+            AdapterConfig::Cargo { .. } => "cargo",
+            AdapterConfig::Python { .. } => "python",
+            AdapterConfig::Tauri { .. } => "tauri",
+            AdapterConfig::Android { .. } => "android",
         }
     }
 }
@@ -46,6 +58,31 @@ pub fn detect(repo: &Path) -> Vec<AdapterConfig> {
     }
     if repo.join("VERSION").exists() {
         v.push(AdapterConfig::PlainFile { file: None });
+    }
+    for f in ["Cargo.toml", "src-tauri/Cargo.toml"] {
+        if repo.join(f).exists() && cargo_span(&std::fs::read_to_string(repo.join(f)).unwrap_or_default()).is_some() {
+            v.push(AdapterConfig::Cargo { file: (f != "Cargo.toml").then(|| f.to_string()) });
+            break;
+        }
+    }
+    if repo.join("pyproject.toml").exists()
+        && python_span(&std::fs::read_to_string(repo.join("pyproject.toml")).unwrap_or_default()).is_some()
+    {
+        v.push(AdapterConfig::Python { file: None });
+    }
+    for f in ["src-tauri/tauri.conf.json", "tauri.conf.json"] {
+        if let Ok(t) = std::fs::read_to_string(repo.join(f)) {
+            if tauri_span(&t).is_some() {
+                v.push(AdapterConfig::Tauri { file: Some(f.to_string()) });
+            }
+            break;
+        }
+    }
+    for f in ["app/build.gradle.kts", "app/build.gradle"] {
+        if repo.join(f).exists() {
+            v.push(AdapterConfig::Android { file: Some(f.to_string()) });
+            break;
+        }
     }
     if v.is_empty() {
         v.push(AdapterConfig::GitTag);
@@ -90,6 +127,16 @@ pub fn read(a: &AdapterConfig, rc: &ReadCtx) -> Result<Version> {
             let text = read_file(rc.repo, file)?;
             let c = re.captures(&text).ok_or_else(|| Error::Version(format!("pattern not found in {file}")))?;
             parse_ver(c.get(1).ok_or_else(|| Error::Version("pattern needs one capture group".into()))?.as_str())
+        }
+        AdapterConfig::Cargo { file } => span_read(rc.repo, file.as_deref().unwrap_or("Cargo.toml"), cargo_span),
+        AdapterConfig::Python { file } => span_read(rc.repo, file.as_deref().unwrap_or("pyproject.toml"), python_span),
+        AdapterConfig::Tauri { file } => span_read(rc.repo, file.as_deref().unwrap_or("src-tauri/tauri.conf.json"), tauri_span),
+        AdapterConfig::Android { file } => {
+            let f = file.as_deref().unwrap_or("app/build.gradle.kts");
+            let t = read_file(rc.repo, f)?;
+            let (a, b) = android_name(&t).ok_or_else(|| Error::Version(format!("no versionName in {f}")))?;
+            // Gradle versionName is often "1.2" or "1.2.3-debug"; pad to semver.
+            parse_loose(&t[a..b])
         }
         AdapterConfig::GitTag => {
             let glob = tag_glob(rc.tag_format);
@@ -137,7 +184,132 @@ pub fn plan_write(a: &AdapterConfig, repo: &Path, next: &Version) -> Result<Vec<
             Ok(vec![FileEdit { path: file.clone(), content }])
         }
         AdapterConfig::GitTag => Ok(vec![]),
+        AdapterConfig::Cargo { file } => {
+            let f = file.as_deref().unwrap_or("Cargo.toml");
+            let text = read_file(repo, f)?;
+            let mut edits = vec![FileEdit { path: f.into(), content: span_replace(&text, cargo_span, &nv, f)? }];
+            // Cargo.lock sits next to the manifest or at the workspace root.
+            let name = cargo_name(&text);
+            let dir = Path::new(f).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            for lock in [format!("{dir}/Cargo.lock").trim_start_matches('/').to_string(), "Cargo.lock".to_string()] {
+                if let (Some(name), Ok(lt)) = (&name, std::fs::read_to_string(repo.join(&lock))) {
+                    let re = Regex::new(&format!(r#"(\[\[package\]\]\r?\nname = "{}"\r?\nversion = ")([^"]+)(")"#, regex::escape(name))).unwrap();
+                    if re.is_match(&lt) {
+                        let out = re.replacen(&lt, 1, |c: &regex::Captures| format!("{}{}{}", &c[1], nv, &c[3]));
+                        edits.push(FileEdit { path: lock, content: out.into_owned() });
+                        break;
+                    }
+                }
+            }
+            Ok(edits)
+        }
+        AdapterConfig::Python { file } => {
+            let f = file.as_deref().unwrap_or("pyproject.toml");
+            Ok(vec![FileEdit { path: f.into(), content: span_replace(&read_file(repo, f)?, python_span, &nv, f)? }])
+        }
+        AdapterConfig::Tauri { file } => {
+            let f = file.as_deref().unwrap_or("src-tauri/tauri.conf.json");
+            Ok(vec![FileEdit { path: f.into(), content: span_replace(&read_file(repo, f)?, tauri_span, &nv, f)? }])
+        }
+        AdapterConfig::Android { file } => {
+            let f = file.as_deref().unwrap_or("app/build.gradle.kts");
+            let mut t = read_file(repo, f)?;
+            let (a, b) = android_name(&t).ok_or_else(|| Error::Version(format!("no versionName in {f}")))?;
+            t.replace_range(a..b, &nv);
+            if let Some((a, b)) = android_code(&t) {
+                let n: u64 = t[a..b].parse().unwrap_or(0);
+                t.replace_range(a..b, &(n + 1).to_string());
+            }
+            Ok(vec![FileEdit { path: f.into(), content: t }])
+        }
     }
+}
+
+// ---------------------------------------------------------------- file formats
+
+type Span = fn(&str) -> Option<(usize, usize)>;
+
+fn span_read(repo: &Path, f: &str, span: Span) -> Result<Version> {
+    let t = read_file(repo, f)?;
+    let (a, b) = span(&t).ok_or_else(|| Error::Version(format!("no version found in {f}")))?;
+    parse_ver(&t[a..b])
+}
+
+fn span_replace(text: &str, span: Span, nv: &str, f: &str) -> Result<String> {
+    let (a, b) = span(text).ok_or_else(|| Error::Version(format!("no version found in {f}")))?;
+    Ok(format!("{}{}{}", &text[..a], nv, &text[b..]))
+}
+
+/// Byte range of `key = "value"` inside the first matching TOML table.
+fn toml_value(text: &str, tables: &[&str], key: &str) -> Option<(usize, usize)> {
+    let hdr = Regex::new(r"(?m)^\s*\[([^\]\[]+)\]\s*(#.*)?$").unwrap();
+    let kv = Regex::new(&format!(r#"(?m)^\s*{}\s*=\s*"([^"]*)""#, regex::escape(key))).unwrap();
+    // Table boundaries: every [x] or [[x]] header.
+    let any_hdr = Regex::new(r"(?m)^\s*\[").unwrap();
+    for want in tables {
+        for c in hdr.captures_iter(text) {
+            if c[1].trim() != *want {
+                continue;
+            }
+            let start = c.get(0).unwrap().end();
+            let end = any_hdr.find_at(text, start).map(|m| m.start()).unwrap_or(text.len());
+            if let Some(m) = kv.captures(&text[start..end]) {
+                let g = m.get(1).unwrap();
+                return Some((start + g.start(), start + g.end()));
+            }
+        }
+    }
+    None
+}
+
+fn cargo_span(t: &str) -> Option<(usize, usize)> {
+    toml_value(t, &["package", "workspace.package"], "version")
+}
+fn cargo_name(t: &str) -> Option<String> {
+    toml_value(t, &["package"], "name").map(|(a, b)| t[a..b].to_string())
+}
+fn python_span(t: &str) -> Option<(usize, usize)> {
+    toml_value(t, &["project", "tool.poetry"], "version")
+}
+
+/// Tauri 2 top-level "version" or Tauri 1 "package": { "version" }. A version
+/// pointing at a file (e.g. "../package.json") is not a version: use npm.
+fn tauri_span(t: &str) -> Option<(usize, usize)> {
+    let j: serde_json::Value = serde_json::from_str(t).ok()?;
+    let v = j["version"].as_str().or_else(|| j["package"]["version"].as_str())?;
+    if v.ends_with(".json") {
+        return None;
+    }
+    let re = Regex::new(&format!(r#""version"\s*:\s*"({})""#, regex::escape(v))).unwrap();
+    let g = re.captures(t)?.get(1)?;
+    Some((g.start(), g.end()))
+}
+
+fn android_name(t: &str) -> Option<(usize, usize)> {
+    let re = Regex::new(r#"(?m)^\s*versionName\s*(?:=\s*)?["']([^"']+)["']"#).unwrap();
+    let g = re.captures(t)?.get(1)?;
+    Some((g.start(), g.end()))
+}
+fn android_code(t: &str) -> Option<(usize, usize)> {
+    let re = Regex::new(r"(?m)^\s*versionCode\s*(?:=\s*)?(\d+)").unwrap();
+    let g = re.captures(t)?.get(1)?;
+    Some((g.start(), g.end()))
+}
+
+/// "1.2" -> 1.2.0, "3" -> 3.0.0; otherwise strict semver.
+fn parse_loose(s: &str) -> Result<Version> {
+    let t = s.trim().trim_start_matches('v');
+    let (core, rest) = match t.find(['-', '+']) {
+        Some(i) => (&t[..i], &t[i..]),
+        None => (t, ""),
+    };
+    let parts = core.split('.').count();
+    let padded = match parts {
+        1 => format!("{core}.0.0{rest}"),
+        2 => format!("{core}.0{rest}"),
+        _ => t.to_string(),
+    };
+    parse_ver(&padded)
 }
 
 fn replace_first(re: &Regex, text: &str, nv: &str, f: &str) -> Result<String> {
@@ -365,6 +537,54 @@ mod tests {
         apply_edits(&ctx, d.path(), &edits).unwrap();
         assert_eq!(std::fs::read_to_string(d.path().join("VERSION")).unwrap(), "1.0.0\n");
         assert!(ctx.performed().is_empty());
+    }
+
+    #[test]
+    fn cargo_adapter_updates_lock() {
+        let toml = "[workspace]\nmembers = []\n\n[package]\nname = \"app\"\nversion = \"0.3.1\" # keep\n\n[dependencies]\nserde = { version = \"1\" }\n";
+        let lock = "[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"app\"\nversion = \"0.3.1\"\n";
+        let d = fixture(&[("Cargo.toml", toml), ("Cargo.lock", lock)]);
+        let e = roundtrip(&AdapterConfig::Cargo { file: None }, &d, "0.3.1", "0.4.0");
+        assert_eq!(e.len(), 2);
+        let t = std::fs::read_to_string(d.path().join("Cargo.toml")).unwrap();
+        assert!(t.contains("version = \"0.4.0\" # keep") && t.contains("serde = { version = \"1\" }"));
+        let l = std::fs::read_to_string(d.path().join("Cargo.lock")).unwrap();
+        assert!(l.contains("name = \"app\"\nversion = \"0.4.0\"") && l.contains("1.0.0"));
+    }
+
+    #[test]
+    fn cargo_workspace_package() {
+        let d = fixture(&[("Cargo.toml", "[workspace.package]\nversion = \"2.0.0\"\n")]);
+        roundtrip(&AdapterConfig::Cargo { file: None }, &d, "2.0.0", "2.1.0");
+    }
+
+    #[test]
+    fn python_adapter() {
+        let d = fixture(&[("pyproject.toml", "[build-system]\nrequires = [\"x\"]\n\n[tool.poetry]\nname = \"p\"\nversion = \"1.4.0\"\n")]);
+        roundtrip(&AdapterConfig::Python { file: None }, &d, "1.4.0", "1.5.0");
+        let d2 = fixture(&[("pyproject.toml", "[project]\nname = \"p\"\nversion = \"0.1.0\"\n")]);
+        roundtrip(&AdapterConfig::Python { file: None }, &d2, "0.1.0", "0.2.0");
+    }
+
+    #[test]
+    fn tauri_adapter() {
+        let d = fixture(&[("tauri.conf.json", "{\n  \"productName\": \"x\",\n  \"version\": \"0.9.0\",\n  \"plugins\": { \"a\": { \"version\": \"9\" } }\n}\n")]);
+        roundtrip(&AdapterConfig::Tauri { file: Some("tauri.conf.json".into()) }, &d, "0.9.0", "1.0.0");
+        assert!(tauri_span("{\"version\": \"../package.json\"}").is_none());
+        assert!(tauri_span("{\"package\": {\"version\": \"1.0.0\"}}").is_some());
+    }
+
+    #[test]
+    fn android_adapter_bumps_code() {
+        for (f, src) in [
+            ("build.gradle.kts", "android {\n    defaultConfig {\n        versionCode = 41\n        versionName = \"2.3\"\n    }\n}\n"),
+            ("build.gradle", "android {\n  defaultConfig {\n    versionCode 41\n    versionName \"2.3.0\"\n  }\n}\n"),
+        ] {
+            let d = fixture(&[(f, src)]);
+            roundtrip(&AdapterConfig::Android { file: Some(f.into()) }, &d, "2.3.0", "2.4.0");
+            let t = std::fs::read_to_string(d.path().join(f)).unwrap();
+            assert!(t.contains("42") && !t.contains("41"), "{t}");
+        }
     }
 
     #[test]

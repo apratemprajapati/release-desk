@@ -55,6 +55,7 @@ fn project(fx: &Fx, local_only: bool) -> Project {
         id: 0, name: "demo".into(), path: fx.work.to_string_lossy().into(), owner: "o".into(), repo: "r".into(),
         account_id: None, default_branch: "main".into(), release_branch: "main".into(),
         tag_format: "v{version}".into(), local_only, adapters: vec![AdapterConfig::Npm { file: None }], pipeline: vec![],
+        options: Default::default(),
     }
 }
 
@@ -225,4 +226,223 @@ fn detect_reads_remote_adapters_and_push_ban() {
     assert_eq!(d.default_branch, "main");
     assert_eq!(d.adapters, vec![AdapterConfig::Npm { file: None }]);
     assert!(d.has_claude_md_push_ban);
+}
+
+// ================================================================ Phase 2
+
+fn pr_json(merged: bool) -> serde_json::Value {
+    json!({ "number": 5, "html_url": "https://github.com/o/r/pull/5", "state": "open", "merged": merged,
+        "mergeable": true, "head": { "ref": "feature", "sha": "abc123" }, "base": { "ref": "main", "sha": "000" } })
+}
+
+async fn mock_checks(gh: &MockServer, statuses: &[(&str, Option<&str>)]) {
+    let runs: Vec<_> = statuses.iter().map(|(s, c)| json!({ "name": "ci", "status": s, "conclusion": c })).collect();
+    Mock::given(method("GET")).and(path("/repos/o/r/commits/abc123/check-runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "total_count": runs.len(), "check_runs": runs })))
+        .mount(gh).await;
+}
+
+#[tokio::test]
+async fn pr_open_wait_and_merge() {
+    let fx = fixture();
+    sh(&fx.work, &["checkout", "-q", "-b", "feature"]);
+    sh(&fx.work, &["add", "."]);
+    sh(&fx.work, &["commit", "-q", "-m", "fix: b"]);
+    sh(&fx.work, &["push", "-q", "origin", "feature"]);
+    let gh = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/repos/o/r/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([]))).mount(&gh).await;
+    Mock::given(method("POST")).and(path("/repos/o/r/pulls"))
+        .respond_with(|req: &Request| {
+            let b: serde_json::Value = req.body_json().unwrap();
+            assert_eq!((b["head"].as_str(), b["base"].as_str()), (Some("feature"), Some("main")));
+            ResponseTemplate::new(201).set_body_json(pr_json(false))
+        }).expect(1).mount(&gh).await;
+    Mock::given(method("GET")).and(path("/repos/o/r/pulls/5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pr_json(false))).mount(&gh).await;
+    mock_checks(&gh, &[("completed", Some("success")), ("in_progress", None)]).await;
+    Mock::given(method("PUT")).and(path("/repos/o/r/pulls/5/merge"))
+        .respond_with(|req: &Request| {
+            let b: serde_json::Value = req.body_json().unwrap();
+            assert_eq!(b["sha"], "abc123", "merge must pin the checked sha");
+            assert_eq!(b["merge_method"], "squash");
+            ResponseTemplate::new(200).set_body_json(json!({ "merged": true }))
+        }).expect(1).mount(&gh).await;
+
+    let d = desk(Some(gh.uri()));
+    let mut p = project(&fx, false);
+    p.options.merge_mode = "pr".into();
+    let pid = d.store.add_project(&p).unwrap();
+    let p = d.store.project(pid).unwrap();
+    assert_eq!(p.options.merge_mode, "pr", "options persist");
+
+    let o = d.step_open_pr(None, &p, false, "Release", "").await;
+    assert!(o.ok, "{}", o.log);
+    assert_eq!(o.meta["pr"], 5);
+
+    let st = d.pr_status(&p, 5).await.unwrap();
+    assert_eq!((st.checks.passed, st.checks.pending), (1, 1));
+    let blocked = d.step_merge_pr(None, &p, false, 5, false).await;
+    assert!(!blocked.ok && blocked.log.contains("not green"), "{}", blocked.log);
+
+    let m = d.step_merge_pr(None, &p, false, 5, true).await;
+    assert!(m.ok, "{}", m.log);
+    assert_eq!(m.meta["synced"], true);
+    assert_eq!(sh(&fx.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    gh.verify().await;
+}
+
+#[test]
+fn local_fast_forward_merge() {
+    let fx = fixture();
+    sh(&fx.work, &["checkout", "-q", "-b", "feature"]);
+    sh(&fx.work, &["add", "."]);
+    sh(&fx.work, &["commit", "-q", "-m", "fix: b"]);
+    let d = desk(None);
+    let pid = d.store.add_project(&project(&fx, true)).unwrap();
+    let p = d.store.project(pid).unwrap();
+    let feature = sh(&fx.work, &["rev-parse", "HEAD"]);
+    let o = d.step_merge_ff(None, &p, false);
+    assert!(o.ok, "{}", o.log);
+    assert_eq!(sh(&fx.work, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    assert_eq!(sh(&fx.work, &["rev-parse", "HEAD"]), feature);
+}
+
+#[tokio::test]
+async fn dispatch_and_attach_artifacts() {
+    let fx = fixture();
+    let gh = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/repos/o/r/actions/workflows/release.yml/dispatches"))
+        .respond_with(|req: &Request| {
+            let b: serde_json::Value = req.body_json().unwrap();
+            assert_eq!(b, json!({ "ref": "v1.1.0", "inputs": { "version": "1.1.0", "title": "Release v1.1.0" } }));
+            ResponseTemplate::new(204)
+        }).expect(1).mount(&gh).await;
+    Mock::given(method("GET")).and(path("/repos/o/r/actions/runs/900/artifacts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "artifacts": [
+            { "id": 1, "name": "dist", "size_in_bytes": 4, "expired": false },
+            { "id": 2, "name": "old", "size_in_bytes": 4, "expired": true },
+            { "id": 3, "name": "docs", "size_in_bytes": 4, "expired": false } ] })))
+        .mount(&gh).await;
+    Mock::given(method("GET")).and(path("/repos/o/r/actions/artifacts/1/zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PK\x03\x04".to_vec())).expect(1).mount(&gh).await;
+    Mock::given(method("GET")).and(path("/repos/o/r/releases/77"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 77, "tag_name": "v1.1.0", "html_url": "",
+            "draft": true, "prerelease": false, "upload_url": format!("{}/upload/77/assets{{?name,label}}", gh.uri()),
+            "assets": [ { "id": 9, "name": "docs.zip" } ] })))
+        .mount(&gh).await;
+    Mock::given(method("POST")).and(path("/upload/77/assets")).and(wiremock::matchers::query_param("name", "dist.zip"))
+        .respond_with(|req: &Request| {
+            assert_eq!(req.body, b"PK\x03\x04".to_vec());
+            ResponseTemplate::new(201).set_body_json(json!({ "id": 10 }))
+        }).expect(1).mount(&gh).await;
+
+    let d = desk(Some(gh.uri()));
+    let mut p = project(&fx, false);
+    p.options.workflow = Some("release.yml".into());
+    p.options.dispatch = true;
+    p.options.dispatch_inputs.insert("title".into(), "Release {tag}".into());
+    let pid = d.store.add_project(&p).unwrap();
+    let p = d.store.project(pid).unwrap();
+
+    let o = d.step_dispatch(None, &p, false, "1.1.0", "notes").await;
+    assert!(o.ok, "{}", o.log);
+    let a = d.step_attach(None, &p, false, 77, 900).await;
+    assert!(a.ok, "{}", a.log);
+    assert_eq!(a.meta["uploaded"], json!(["dist.zip"]));
+    assert_eq!(a.meta["skipped"], json!(["docs.zip"]));
+    gh.verify().await;
+}
+
+#[tokio::test]
+async fn phase2_dry_run_and_local_only_send_nothing() {
+    let fx = fixture();
+    let gh = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/repos/o/r/actions/runs/900/artifacts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "artifacts": [ { "id": 1, "name": "dist", "size_in_bytes": 4 } ] })))
+        .mount(&gh).await;
+    for m in ["POST", "PUT", "PATCH", "DELETE"] {
+        Mock::given(method(m)).respond_with(ResponseTemplate::new(500)).expect(0).mount(&gh).await;
+    }
+    let d = desk(Some(gh.uri()));
+    let mut p = project(&fx, false);
+    p.options.workflow = Some("release.yml".into());
+    let pid = d.store.add_project(&p).unwrap();
+    let p = d.store.project(pid).unwrap();
+    let before = snapshot(&fx);
+    let disp = d.step_dispatch(None, &p, true, "1.1.0", "n").await;
+    assert!(disp.ok && disp.log.contains("[dry-run] would POST"), "{}", disp.log);
+    let att = d.step_attach(None, &p, true, 0, 900).await;
+    assert!(att.ok && att.log.contains("[dry-run] would upload dist.zip"), "{}", att.log);
+    assert!(d.actions_control(None, &p, true, 900, "cancel").await.ok);
+    assert_eq!(before, snapshot(&fx));
+
+    let mut lp = p.clone();
+    lp.local_only = true;
+    for o in [
+        d.step_open_pr(None, &lp, false, "t", "").await,
+        d.step_merge_pr(None, &lp, false, 5, true).await,
+        d.step_dispatch(None, &lp, false, "1.1.0", "n").await,
+        d.step_attach(None, &lp, false, 77, 900).await,
+        d.actions_control(None, &lp, false, 900, "rerun").await,
+    ] {
+        assert!(!o.ok && o.log.contains("local-only"), "{}", o.log);
+    }
+    assert!(d.actions_runs(&lp, None).await.is_err());
+    gh.verify().await;
+}
+
+#[test]
+fn rollback_local_release_and_refuse_pushed() {
+    let fx = fixture();
+    let d = desk(None);
+    let pid = d.store.add_project(&project(&fx, true)).unwrap();
+    let p = d.store.project(pid).unwrap();
+    let head = sh(&fx.work, &["rev-parse", "HEAD"]);
+    assert!(d.step_version(None, &p, false, "1.1.0").ok);
+    assert!(d.step_tag(None, &p, false, "1.1.0", "n").ok);
+    assert_ne!(sh(&fx.work, &["rev-parse", "HEAD"]), head);
+
+    let r = d.rollback(None, &p, false, "1.1.0");
+    assert!(r.ok, "{}", r.log);
+    assert_eq!(sh(&fx.work, &["rev-parse", "HEAD"]), head);
+    assert!(!sh(&fx.work, &["tag", "-l"]).contains("v1.1.0"));
+    assert!(std::fs::read_to_string(fx.work.join("package.json")).unwrap().contains("\"1.0.0\""));
+    assert_eq!(sh(&fx.work, &["status", "--porcelain"]), "?? b.txt", "only the pre-existing untracked file remains");
+
+    // Pushed release: refused, nothing changes.
+    let pid2 = d.store.add_project(&Project { path: format!("{}/", fx.work.display()), ..project(&fx, false) }).unwrap();
+    let p2 = d.store.project(pid2).unwrap();
+    assert!(d.step_version(None, &p2, false, "1.1.0").ok);
+    assert!(d.step_tag(None, &p2, false, "1.1.0", "n").ok);
+    let pushed = sh(&fx.work, &["rev-parse", "HEAD"]);
+    let r2 = d.rollback(None, &p2, false, "1.1.0");
+    assert!(!r2.ok && r2.log.contains("already pushed"), "{}", r2.log);
+    assert_eq!(sh(&fx.work, &["rev-parse", "HEAD"]), pushed);
+}
+
+#[tokio::test]
+async fn resume_collects_state() {
+    let fx = fixture();
+    let gh = github_mock().await;
+    let d = desk(Some(gh.uri()));
+    let pid = d.store.add_project(&project(&fx, false)).unwrap();
+    let p = d.store.project(pid).unwrap();
+    let run = d.store.start_run(pid, "1.0.0", "1.0.0", false).unwrap();
+    assert!(d.step_version(Some(run), &p, false, "1.1.0").ok);
+    assert!(d.step_notes(Some(run), &p, false, "my notes").ok);
+    assert!(d.step_tag(Some(run), &p, false, "1.1.0", "my notes").ok);
+    assert!(d.step_release(Some(run), &p, false, "1.1.0", "my notes", false).await.ok);
+    // Simulated failure on publish (bad id), then resume.
+    let f = d.step_publish(Some(run), &p, false, 999).await;
+    assert!(!f.ok);
+    assert_eq!(d.store.run(run).unwrap().status, "failed");
+    let info = d.resume_info(run).unwrap();
+    assert_eq!(info.to_version, "1.1.0");
+    assert_eq!(info.notes.as_deref(), Some("my notes"));
+    assert_eq!(info.release_id, Some(77));
+    assert_eq!(info.steps.get("publish").map(String::as_str), Some("failed"));
+    assert_eq!(d.store.run(run).unwrap().status, "running");
+    assert!(d.step_publish(Some(run), &p, false, 77).await.ok);
+    assert_eq!(d.store.run(run).unwrap().status, "done");
 }

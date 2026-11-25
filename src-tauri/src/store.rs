@@ -21,6 +21,39 @@ pub struct Project {
     pub adapters: Vec<AdapterConfig>,
     #[serde(default)]
     pub pipeline: Vec<String>,
+    #[serde(default)]
+    pub options: ProjectOptions,
+}
+
+/// Phase 2 per-project settings (`options_json`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProjectOptions {
+    /// "none" (release from the current branch), "pr" or "ff" (local fast-forward).
+    pub merge_mode: String,
+    /// "merge", "squash" or "rebase" for PR merges.
+    pub merge_method: String,
+    /// Workflow file name in .github/workflows, e.g. "release.yml".
+    pub workflow: Option<String>,
+    /// true: call workflow_dispatch. false: rely on the tag push to trigger it.
+    pub dispatch: bool,
+    /// Dispatch inputs; values may use {version}, {tag} and {notes}.
+    pub dispatch_inputs: std::collections::BTreeMap<String, String>,
+    /// Upload the run's artifacts to the release as zip assets.
+    pub attach_artifacts: bool,
+}
+
+impl Default for ProjectOptions {
+    fn default() -> Self {
+        ProjectOptions {
+            merge_mode: "none".into(),
+            merge_method: "squash".into(),
+            workflow: None,
+            dispatch: false,
+            dispatch_inputs: [("version".to_string(), "{version}".to_string())].into(),
+            attach_artifacts: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,7 +88,8 @@ pub struct Step {
     pub finished_at: Option<String>,
 }
 
-pub const DEFAULT_PIPELINE: &[&str] = &["status", "commit", "push", "version", "notes", "tag", "release"];
+pub const DEFAULT_PIPELINE: &[&str] =
+    &["status", "commit", "push", "merge", "version", "notes", "tag", "actions", "release", "publish"];
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -97,6 +131,8 @@ impl Store {
               started_at TEXT NOT NULL, finished_at TEXT);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
+        // Phase 2 migration: idempotent, the error just means the column exists.
+        let _ = conn.execute("ALTER TABLE projects ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}'", []);
         Ok(Store { conn: Mutex::new(conn) })
     }
 
@@ -148,9 +184,10 @@ impl Store {
         };
         c.execute(
             "INSERT INTO projects(name,path,owner,repo,account_id,default_branch,release_branch,tag_format,
-             local_only,pipeline_json,adapters_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+             local_only,pipeline_json,adapters_json,created_at,options_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![p.name, p.path, p.owner, p.repo, p.account_id, p.default_branch, p.release_branch,
-                p.tag_format, p.local_only, serde_json::to_string(&pipeline)?, serde_json::to_string(&p.adapters)?, now()],
+                p.tag_format, p.local_only, serde_json::to_string(&pipeline)?, serde_json::to_string(&p.adapters)?, now(),
+                serde_json::to_string(&p.options)?],
         )
         .map_err(|e| match e {
             rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation => {
@@ -164,9 +201,10 @@ impl Store {
     pub fn update_project(&self, p: &Project) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE projects SET name=?,owner=?,repo=?,account_id=?,default_branch=?,release_branch=?,
-             tag_format=?,local_only=?,pipeline_json=?,adapters_json=? WHERE id=?",
+             tag_format=?,local_only=?,pipeline_json=?,adapters_json=?,options_json=? WHERE id=?",
             params![p.name, p.owner, p.repo, p.account_id, p.default_branch, p.release_branch, p.tag_format,
-                p.local_only, serde_json::to_string(&p.pipeline)?, serde_json::to_string(&p.adapters)?, p.id],
+                p.local_only, serde_json::to_string(&p.pipeline)?, serde_json::to_string(&p.adapters)?,
+                serde_json::to_string(&p.options)?, p.id],
         )?;
         Ok(())
     }
@@ -175,17 +213,19 @@ impl Store {
         let c = self.conn.lock().unwrap();
         let mut st = c.prepare(
             "SELECT id,name,path,owner,repo,account_id,default_branch,release_branch,tag_format,local_only,
-             pipeline_json,adapters_json FROM projects ORDER BY name COLLATE NOCASE",
+             pipeline_json,adapters_json,options_json FROM projects ORDER BY name COLLATE NOCASE",
         )?;
         let rows = st.query_map([], |r| {
             let pipeline: String = r.get(10)?;
             let adapters: String = r.get(11)?;
+            let options: String = r.get(12)?;
             Ok(Project {
                 id: r.get(0)?, name: r.get(1)?, path: r.get(2)?, owner: r.get(3)?, repo: r.get(4)?,
                 account_id: r.get(5)?, default_branch: r.get(6)?, release_branch: r.get(7)?,
                 tag_format: r.get(8)?, local_only: r.get(9)?,
                 pipeline: serde_json::from_str(&pipeline).unwrap_or_default(),
                 adapters: serde_json::from_str(&adapters).unwrap_or_default(),
+                options: serde_json::from_str(&options).unwrap_or_default(),
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -228,6 +268,10 @@ impl Store {
             params![run_id, key, status, log, meta, started, now()],
         )?;
         Ok(())
+    }
+
+    pub fn run(&self, id: i64) -> Result<Run> {
+        self.runs(None)?.into_iter().find(|r| r.id == id).ok_or_else(|| Error::Store("run not found".into()))
     }
 
     pub fn runs(&self, project_id: Option<i64>) -> Result<Vec<Run>> {
@@ -321,7 +365,7 @@ mod tests {
         let p = Project {
             id: 0, name: "x".into(), path: "/tmp/x".into(), owner: "o".into(), repo: "r".into(), account_id: None,
             default_branch: "main".into(), release_branch: "main".into(), tag_format: "v{version}".into(),
-            local_only: true, adapters: vec![AdapterConfig::GitTag], pipeline: vec![],
+            local_only: true, adapters: vec![AdapterConfig::GitTag], pipeline: vec![], options: Default::default(),
         };
         let id = s.add_project(&p).unwrap();
         assert!(s.add_project(&p).is_err(), "duplicate path rejected");

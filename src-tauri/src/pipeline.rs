@@ -392,3 +392,320 @@ impl Desk {
         self.store.set_run(run, None, status)
     }
 }
+
+// ================================================================ Phase 2
+
+fn render_input(tpl: &str, version: &str, tag: &str, notes_md: &str) -> String {
+    tpl.replace("{version}", version).replace("{tag}", tag).replace("{notes}", notes_md)
+}
+
+fn parse_next(next: &str) -> Result<Version> {
+    Version::parse(next.trim_start_matches('v')).map_err(|e| Error::Version(e.to_string()))
+}
+
+#[derive(Debug, Serialize)]
+pub struct PrStatus {
+    pub pr: crate::github::Pr,
+    pub checks: crate::github::Checks,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResumeInfo {
+    pub run_id: i64,
+    pub project_id: i64,
+    pub dry_run: bool,
+    pub status: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub notes: Option<String>,
+    pub pr_number: Option<u64>,
+    pub release_id: Option<u64>,
+    pub actions_run_id: Option<u64>,
+    /// Latest status per step key.
+    pub steps: std::collections::BTreeMap<String, String>,
+}
+
+impl Desk {
+    fn gh(&self, p: &Project) -> Result<(Account, Client)> {
+        self.client_for(p)?.ok_or_else(|| Error::GitHub("no GitHub account configured (Settings)".into()))
+    }
+
+    // ------------------------------------------------------------ merge
+
+    /// Find or open a PR from the current branch into the default branch.
+    pub async fn step_open_pr(&self, run: Option<i64>, p: &Project, dry: bool, title: &str, body: &str) -> StepOutcome {
+        let ctx = self.ctx(dry);
+        let started = now();
+        let r = async {
+            guard_remote(p, "pull request")?;
+            let repo = Desk::repo(p);
+            let head = git::current_branch(&ctx, &repo)?;
+            if head == p.default_branch {
+                return Err(Error::Blocked(format!(
+                    "already on '{head}'. Work on a feature branch, or set merge mode to 'none' for this project"
+                )));
+            }
+            let (acc, gh) = self.gh(p)?;
+            ctx.log(&format!("account: {} ({})", acc.label, acc.github_login));
+            let pr = match gh.find_open_pr(&ctx, &p.owner, &p.repo, &head, &p.default_branch).await? {
+                Some(pr) => {
+                    ctx.log(&format!("PR #{} already open for {head}", pr.number));
+                    Some(pr)
+                }
+                None => gh.create_pr(&ctx, &p.owner, &p.repo, &head, &p.default_branch, title, body).await?,
+            };
+            Ok(match pr {
+                Some(pr) => json!({ "pr": pr.number, "url": pr.html_url, "head": head, "base": p.default_branch }),
+                None => json!({ "pr": null, "head": head, "base": p.default_branch, "dry_run": true }),
+            })
+        }
+        .await;
+        self.record(run, "pr", &started, &ctx, &r)
+    }
+
+    /// PR state plus check-run summary for its head commit (read-only, polled by the UI).
+    pub async fn pr_status(&self, p: &Project, n: u64) -> Result<PrStatus> {
+        guard_remote(p, "pull request")?;
+        let ctx = self.ctx(false);
+        let (_, gh) = self.gh(p)?;
+        let pr = gh.get_pr(&ctx, &p.owner, &p.repo, n).await?;
+        let checks = gh.checks(&ctx, &p.owner, &p.repo, &pr.head.sha).await?;
+        Ok(PrStatus { pr, checks })
+    }
+
+    /// Merge the PR (pinned to the head sha that was checked), then bring the
+    /// local default branch up to date with a fast-forward.
+    pub async fn step_merge_pr(&self, run: Option<i64>, p: &Project, dry: bool, n: u64, allow_failing: bool) -> StepOutcome {
+        let ctx = self.ctx(dry);
+        let started = now();
+        let r = async {
+            guard_remote(p, "merge")?;
+            let repo = Desk::repo(p);
+            let (_, gh) = self.gh(p)?;
+            let pr = gh.get_pr(&ctx, &p.owner, &p.repo, n).await?;
+            if pr.merged {
+                ctx.log(&format!("PR #{n} is already merged"));
+            } else {
+                let c = gh.checks(&ctx, &p.owner, &p.repo, &pr.head.sha).await?;
+                ctx.log(&format!("checks: {} passed, {} failed, {} pending", c.passed, c.failed, c.pending));
+                if (c.failed > 0 || c.pending > 0) && !allow_failing {
+                    return Err(Error::Blocked("checks are not green yet".into()));
+                }
+                if pr.mergeable == Some(false) {
+                    return Err(Error::Blocked(format!("PR #{n} has conflicts")));
+                }
+                gh.merge_pr(&ctx, &p.owner, &p.repo, n, &p.options.merge_method, &pr.head.sha).await?;
+            }
+            let st = git::status(&ctx, &repo)?;
+            if !st.files.is_empty() {
+                ctx.log("working tree not clean: skipped switching to the default branch");
+                return Ok(json!({ "pr": n, "merged": true, "synced": false }));
+            }
+            git::fetch(&ctx, &repo)?;
+            git::checkout(&ctx, &repo, &p.default_branch)?;
+            git::merge_ff_only(&ctx, &repo, &format!("origin/{}", p.default_branch))?;
+            Ok(json!({ "pr": n, "merged": true, "synced": true, "method": p.options.merge_method }))
+        }
+        .await;
+        self.record(run, "merge", &started, &ctx, &r)
+    }
+
+    /// Local fast-forward of the default branch to the current branch. Allowed
+    /// for local-only projects: it never touches a remote.
+    pub fn step_merge_ff(&self, run: Option<i64>, p: &Project, dry: bool) -> StepOutcome {
+        let ctx = self.ctx(dry);
+        let started = now();
+        let r = (|| {
+            let repo = Desk::repo(p);
+            let head = git::current_branch(&ctx, &repo)?;
+            if head == p.default_branch {
+                ctx.log(&format!("already on {head}, nothing to merge"));
+                return Ok(json!({ "skipped": true }));
+            }
+            if !git::status(&ctx, &repo)?.files.is_empty() {
+                return Err(Error::Blocked("commit or discard changes before merging".into()));
+            }
+            git::checkout(&ctx, &repo, &p.default_branch)?;
+            git::merge_ff_only(&ctx, &repo, &head)?;
+            Ok(json!({ "from": head, "into": p.default_branch }))
+        })();
+        self.record(run, "merge", &started, &ctx, &r)
+    }
+
+    // ------------------------------------------------------------ actions
+
+    pub async fn step_dispatch(&self, run: Option<i64>, p: &Project, dry: bool, next: &str, notes_md: &str) -> StepOutcome {
+        let ctx = self.ctx(dry);
+        let started = now();
+        let r = async {
+            guard_remote(p, "workflow dispatch")?;
+            let wf = p.options.workflow.clone().filter(|w| !w.trim().is_empty())
+                .ok_or_else(|| Error::Other("no workflow set for this project (Edit project)".into()))?;
+            let v = parse_next(next)?;
+            let tag = version::render_tag(&p.tag_format, &v);
+            let inputs: serde_json::Map<String, Value> = p.options.dispatch_inputs.iter()
+                .map(|(k, t)| (k.clone(), Value::String(render_input(t, &v.to_string(), &tag, notes_md))))
+                .collect();
+            let (_, gh) = self.gh(p)?;
+            gh.dispatch(&ctx, &p.owner, &p.repo, &wf, &tag, &Value::Object(inputs.clone())).await?;
+            Ok(json!({ "workflow": wf, "ref": tag, "inputs": inputs }))
+        }
+        .await;
+        self.record(run, "dispatch", &started, &ctx, &r)
+    }
+
+    /// Runs for the release tag's commit (falls back to HEAD).
+    pub async fn actions_runs(&self, p: &Project, git_ref: Option<&str>) -> Result<Vec<crate::github::WorkflowRun>> {
+        guard_remote(p, "Actions")?;
+        let ctx = self.ctx(false);
+        let repo = Desk::repo(p);
+        let sha = match git_ref {
+            Some(r) if !r.is_empty() => git::commit_of(&ctx, &repo, r).or_else(|_| git::head_sha(&ctx, &repo))?,
+            _ => git::head_sha(&ctx, &repo)?,
+        };
+        let (_, gh) = self.gh(p)?;
+        gh.runs_for_sha(&ctx, &p.owner, &p.repo, &sha).await
+    }
+
+    pub async fn actions_jobs(&self, p: &Project, run_id: u64) -> Result<Vec<crate::github::Job>> {
+        guard_remote(p, "Actions")?;
+        let (_, gh) = self.gh(p)?;
+        gh.jobs(&self.ctx(false), &p.owner, &p.repo, run_id).await
+    }
+
+    /// Cancel or re-run failed jobs. `action` is "cancel" or "rerun".
+    pub async fn actions_control(&self, run: Option<i64>, p: &Project, dry: bool, run_id: u64, action: &str) -> StepOutcome {
+        let ctx = self.ctx(dry);
+        let started = now();
+        let r = async {
+            guard_remote(p, "Actions")?;
+            let (_, gh) = self.gh(p)?;
+            match action {
+                "cancel" => gh.cancel_run(&ctx, &p.owner, &p.repo, run_id).await?,
+                "rerun" => gh.rerun_failed(&ctx, &p.owner, &p.repo, run_id).await?,
+                _ => return Err(Error::Other(format!("unknown action {action}"))),
+            }
+            Ok(json!({ "actions_run": run_id, "action": action }))
+        }
+        .await;
+        self.record(run, &format!("actions-{action}"), &started, &ctx, &r)
+    }
+
+    /// Download each artifact of a workflow run and upload it to the release as
+    /// `<name>.zip`. Assets that already exist are skipped (safe to repeat).
+    pub async fn step_attach(&self, run: Option<i64>, p: &Project, dry: bool, release_id: u64, actions_run: u64) -> StepOutcome {
+        let ctx = self.ctx(dry);
+        let started = now();
+        let r = async {
+            guard_remote(p, "release assets")?;
+            let (_, gh) = self.gh(p)?;
+            let arts = gh.run_artifacts(&ctx, &p.owner, &p.repo, actions_run).await?;
+            let rel: Option<crate::github::Release> = if release_id == 0 {
+                None
+            } else {
+                Some(gh.get_json(&ctx, &format!("/repos/{}/{}/releases/{release_id}", p.owner, p.repo), "get release").await?)
+            };
+            let mut uploaded = vec![];
+            let mut skipped = vec![];
+            for a in arts.iter().filter(|a| !a.expired) {
+                let name = format!("{}.zip", a.name);
+                if rel.as_ref().map_or(false, |r| r.assets.iter().any(|x| x.name == name)) {
+                    ctx.log(&format!("{name} already attached"));
+                    skipped.push(name);
+                    continue;
+                }
+                match &rel {
+                    Some(rel) if !dry => {
+                        let bytes = gh.download_artifact(&ctx, &p.owner, &p.repo, a.id).await?;
+                        gh.upload_asset(&ctx, rel, &name, bytes).await?;
+                    }
+                    _ => {
+                        ctx.side_effect(&format!("upload {name} ({} bytes) to release {release_id}", a.size_in_bytes));
+                    }
+                }
+                uploaded.push(name);
+            }
+            if arts.is_empty() {
+                ctx.log("this run has no artifacts");
+            }
+            Ok(json!({ "actions_run": actions_run, "uploaded": uploaded, "skipped": skipped }))
+        }
+        .await;
+        self.record(run, "attach", &started, &ctx, &r)
+    }
+
+    // ------------------------------------------------------------ rollback
+
+    /// Undo a local release that has not reached the remote: delete the local
+    /// tag, drop the `chore(release)` commit (soft reset) and restore the version
+    /// files. Refuses if the commit or tag is already on the remote.
+    pub fn rollback(&self, run: Option<i64>, p: &Project, dry: bool, next: &str) -> StepOutcome {
+        let ctx = self.ctx(dry);
+        let started = now();
+        let r = (|| {
+            let repo = Desk::repo(p);
+            let v = parse_next(next)?;
+            let tag = version::render_tag(&p.tag_format, &v);
+            let subject = git::subject(&ctx, &repo, "HEAD")?;
+            let release_commit = subject == format!("chore(release): {tag}");
+            if release_commit && !p.local_only && git::is_on_remote(&ctx, &repo, "HEAD")? {
+                return Err(Error::Blocked(format!("{tag} commit is already pushed. Rollback never rewrites remote history")));
+            }
+            if git::tag_exists(&ctx, &repo, &tag) {
+                if !p.local_only && git::read(&ctx, &repo, &["ls-remote", "--tags", "origin", &format!("refs/tags/{tag}")])
+                    .map(|o| !o.trim().is_empty()).unwrap_or(false)
+                {
+                    return Err(Error::Blocked(format!("tag {tag} is already on origin")));
+                }
+                git::write(&ctx, &repo, &["tag", "-d", &tag])?;
+            }
+            if release_commit {
+                git::write(&ctx, &repo, &["reset", "--soft", "HEAD~1"])?;
+            }
+            // Restore version files to HEAD (drops the bump whether committed or not).
+            let mut files = vec![];
+            for a in &p.adapters {
+                files.extend(version::plan_write(a, &repo, &v).unwrap_or_default().into_iter().map(|e| e.path));
+            }
+            if !files.is_empty() {
+                let mut args = vec!["checkout", "HEAD", "--"];
+                args.extend(files.iter().map(|s| s.as_str()));
+                git::write(&ctx, &repo, &args)?;
+            }
+            if let Some(id) = run {
+                let _ = self.store.set_run(id, None, if dry { "dry-run" } else { "rolled-back" });
+            }
+            Ok(json!({ "tag": tag, "removed_commit": release_commit, "restored": files }))
+        })();
+        self.record(run, "rollback", &started, &ctx, &r)
+    }
+
+    // ------------------------------------------------------------ resume
+
+    pub fn resume_info(&self, run_id: i64) -> Result<ResumeInfo> {
+        let r = self.store.run(run_id)?;
+        let mut info = ResumeInfo {
+            run_id, project_id: r.project_id, dry_run: r.dry_run, status: r.status.clone(),
+            from_version: r.from_version, to_version: r.to_version, notes: None, pr_number: None,
+            release_id: None, actions_run_id: None, steps: Default::default(),
+        };
+        for s in &r.steps {
+            info.steps.insert(s.step_key.clone(), s.status.clone());
+            let m: Value = serde_json::from_str(&s.meta_json).unwrap_or(Value::Null);
+            if s.status == "failed" {
+                continue;
+            }
+            match s.step_key.as_str() {
+                "notes" => info.notes = m["notes"].as_str().map(String::from),
+                "pr" | "merge" => info.pr_number = m["pr"].as_u64().or(info.pr_number),
+                "release" => info.release_id = m["release_id"].as_u64(),
+                "attach" | "actions-rerun" => info.actions_run_id = m["actions_run"].as_u64(),
+                _ => {}
+            }
+        }
+        if r.status == "failed" || r.status == "running" {
+            self.store.set_run(run_id, None, "running")?;
+        }
+        Ok(info)
+    }
+}

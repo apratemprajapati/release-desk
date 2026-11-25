@@ -17,6 +17,7 @@ fn is_read(args: &[&str]) -> bool {
         Some(&"tag") => args.len() == 1 || args[1] == "-l" || args[1] == "--list",
         Some(&"remote") => args.get(1).map_or(true, |a| *a == "get-url" || *a == "-v"),
         Some(&"config") => args.iter().any(|a| *a == "--get"),
+        Some(&"branch") => args.iter().any(|a| *a == "--contains" || *a == "--show-current" || *a == "--list"),
         Some(c) => READ_ONLY.contains(c),
         None => true,
     }
@@ -234,6 +235,34 @@ pub fn push(ctx: &Ctx, repo: &Path, refspec: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn subject(ctx: &Ctx, repo: &Path, rev: &str) -> Result<String> {
+    Ok(read(ctx, repo, &["log", "-1", "--format=%s", rev])?.trim().to_string())
+}
+
+pub fn commit_of(ctx: &Ctx, repo: &Path, rev: &str) -> Result<String> {
+    Ok(read(ctx, repo, &["rev-parse", &format!("{rev}^{{commit}}")])?.trim().to_string())
+}
+
+/// True when any remote-tracking branch already contains `rev`.
+pub fn is_on_remote(ctx: &Ctx, repo: &Path, rev: &str) -> Result<bool> {
+    Ok(!read(ctx, repo, &["branch", "-r", "--contains", rev])?.trim().is_empty())
+}
+
+pub fn fetch(ctx: &Ctx, repo: &Path) -> Result<()> {
+    write(ctx, repo, &["fetch", "origin", "--prune", "--tags"])?;
+    Ok(())
+}
+
+pub fn checkout(ctx: &Ctx, repo: &Path, branch: &str) -> Result<()> {
+    write(ctx, repo, &["checkout", branch])?;
+    Ok(())
+}
+
+pub fn merge_ff_only(ctx: &Ctx, repo: &Path, rev: &str) -> Result<()> {
+    write(ctx, repo, &["merge", "--ff-only", rev])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +298,8 @@ mod tests {
         assert!(!is_read(&["tag", "-a", "v1"]));
         assert!(!is_read(&["push", "origin", "main"]));
         assert!(is_read(&["remote", "get-url", "origin"]));
+        assert!(is_read(&["branch", "-r", "--contains", "HEAD"]));
+        assert!(!is_read(&["branch", "-D", "x"]));
+        assert!(!is_read(&["fetch", "origin"]));
     }
 }
