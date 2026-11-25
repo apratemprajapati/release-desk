@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Release Desk repo config",
+  "description": "Optional release-desk.json at the repo root. Overrides the app's project settings. It can turn local_only on but never off.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "tag_format": {
+      "type": "string",
+      "pattern": "\\{version\\}",
+      "default": "v{version}"
+    },
+    "default_branch": {
+      "type": "string"
+    },
+    "release_branch": {
+      "type": "string"
+    },
+    "local_only": {
+      "type": "boolean",
+      "description": "true blocks push, PRs, dispatch and releases. false is ignored."
+    },
+    "version_files": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "npm",
+                  "plain-file",
+                  "cargo",
+                  "python",
+                  "tauri",
+                  "android"
+                ]
+              },
+              "file": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "file",
+              "pattern"
+            ],
+            "properties": {
+              "kind": {
+                "const": "regex"
+              },
+              "file": {
+                "type": "string"
+              },
+              "pattern": {
+                "type": "string",
+                "description": "Regex with one capture group around the version"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "git-tag"
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
+      "description": "The first entry is the source of truth"
+    },
+    "pipeline": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "status",
+          "commit",
+          "push",
+          "merge",
+          "version",
+          "notes",
+          "tag",
+          "actions",
+          "release",
+          "publish"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "options": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "merge_mode": {
+          "enum": [
+            "none",
+            "pr",
+            "ff"
+          ]
+        },
+        "merge_method": {
+          "enum": [
+            "merge",
+            "squash",
+            "rebase"
+          ]
+        },
+        "workflow": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "File name in .github/workflows"
+        },
+        "dispatch": {
+          "type": "boolean",
+          "description": "true: call workflow_dispatch. false: the tag push triggers the workflow"
+        },
+        "dispatch_inputs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Values may use {version}, {tag}, {notes}"
+        },
+        "attach_artifacts": {
+          "type": "boolean"
+        },
+        "attach_mode": {
+          "enum": [
+            "files",
+            "zip"
+          ]
+        },
+        "changelog": {
+          "type": "boolean"
+        },
+        "changelog_file": {
+          "type": "string"
+        },
+        "runner_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -44,8 +44,9 @@ export function Field({ label, hint, children }: { label: string; hint?: string;
   );
 }
 
-export const inputCls =
-  "w-full rounded-md border border-line bg-bg px-2.5 py-1.5 text-[13px] outline-none focus:border-accent";
+/** Layout only. Inputs and selects keep their native OS look: never add colours,
+ *  borders, padding or `appearance` here. */
+export const inputCls = "w-full box-border";
 
 export function Log({ text }: { text: string }) {
   const ref = useRef<HTMLPreElement>(null);

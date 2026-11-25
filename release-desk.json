@@ -1,0 +1,15 @@
+{
+  "$schema": "./release-desk.schema.json",
+  "tag_format": "v{version}",
+  "version_files": [
+    { "kind": "npm", "file": null },
+    { "kind": "cargo", "file": "src-tauri/Cargo.toml" },
+    { "kind": "tauri", "file": "src-tauri/tauri.conf.json" }
+  ],
+  "options": {
+    "workflow": "release.yml",
+    "changelog": true,
+    "attach_artifacts": true,
+    "attach_mode": "files"
+  }
+}

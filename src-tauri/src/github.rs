@@ -377,6 +377,16 @@ impl Client {
         Ok(())
     }
 
+    /// Self-hosted runners registered on the repo (needs Administration: read).
+    pub async fn runners(&self, ctx: &Ctx, o: &str, r: &str) -> Result<Value> {
+        let (s, v) = self.get(ctx, &format!("/repos/{o}/{r}/actions/runners?per_page=100")).await?;
+        if s == StatusCode::FORBIDDEN || s == StatusCode::NOT_FOUND {
+            return Err(Error::GitHub("the token cannot list runners: it needs Administration read access on this repo".into()));
+        }
+        Self::check(s, &v, "runners")?;
+        Ok(v["runners"].clone())
+    }
+
     pub async fn publish(&self, ctx: &Ctx, owner: &str, repo: &str, id: u64) -> Result<Release> {
         let r = self
             .mutate(ctx, Method::PATCH, &format!("/repos/{owner}/{repo}/releases/{id}"), json!({ "draft": false }))

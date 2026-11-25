@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { ask as nativeAsk } from "@tauri-apps/plugin-dialog";
 import { Account, api, Base, Bump, errText, openUrl, Plan, PrStatus, Project, StepOutcome, WorkflowRun } from "../lib/api";
 import { Badge, Button, Card, Confirm, inputCls, Log } from "../components/ui";
 import { Changes } from "../components/Changes";
@@ -58,14 +59,20 @@ export default function Wizard({ id, resumeRunId, go }: { id: number; resumeRunI
   const [allowFailing, setAllowFailing] = useState(false);
   const [actionsRun, setActionsRun] = useState<WorkflowRun | null>(null);
   const [actionsRunId, setActionsRunId] = useState<number | null>(null);
+  const [repoConfig, setRepoConfig] = useState<string[]>([]);
+  const [aiReady, setAiReady] = useState(false);
   const [confirm, setConfirm] = useState<null | { title: string; lines: [string, string][]; run: () => void; danger?: boolean }>(null);
 
   // ---------------------------------------------------------------- load / resume
   useEffect(() => {
     (async () => {
-      const ps = await api.listProjects();
-      const p = ps.find((x) => x.id === id) ?? null;
+      // Effective settings: the repo's release-desk.json applied on top.
+      const eff = await api.effectiveProject(id).catch(() => null);
+      const p = eff?.project ?? null;
+      if (eff) setRepoConfig(eff.repo_config);
+      if (eff?.repo_config_error) append("release-desk.json", `ERROR: ${eff.repo_config_error}`);
       setProject(p);
+      api.settings().then((s) => setAiReady(s.ai_key_set)).catch(() => {});
       setState(initialStates(p));
       const accts = await api.accounts();
       setAccount(accts.find((a) => a.id === p?.account_id) ?? accts[0] ?? null);
@@ -186,8 +193,9 @@ export default function Wizard({ id, resumeRunId, go }: { id: number; resumeRunI
     const k = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === "Enter") (document.querySelector("[data-primary]") as HTMLButtonElement | null)?.click();
       if (e.altKey && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
-        const i = STEPS.findIndex((s) => s.key === active) + (e.key === "ArrowDown" ? 1 : -1);
-        if (STEPS[i]) setActive(STEPS[i].key);
+        const vis = STEPS.filter((s) => !project?.pipeline.length || (s.key === "changes" ? true : project.pipeline.includes(s.key)));
+        const i = vis.findIndex((s) => s.key === active) + (e.key === "ArrowDown" ? 1 : -1);
+        if (vis[i]) setActive(vis[i].key);
       }
     };
     window.addEventListener("keydown", k);
@@ -197,6 +205,10 @@ export default function Wizard({ id, resumeRunId, go }: { id: number; resumeRunI
   if (!project) return <p className="p-6 text-mute">Loading…</p>;
   const o = project.options;
   const locked = (k: Key) => project.local_only && STEPS.find((s) => s.key === k)!.remote;
+  const enabled = (k: Key) => !project.pipeline.length || (k === "changes"
+    ? project.pipeline.includes("status") || project.pipeline.includes("commit")
+    : project.pipeline.includes(k));
+  const visible = STEPS.filter((s) => enabled(s.key));
   const needPlan = (k: Key) => ["tag", "actions", "release", "publish"].includes(k) && !plan;
 
   return (
@@ -222,7 +234,7 @@ export default function Wizard({ id, resumeRunId, go }: { id: number; resumeRunI
 
       <div className="flex min-h-0 flex-1">
         <ol className="w-56 shrink-0 border-r border-line p-3">
-          {STEPS.map((s, i) => (
+          {visible.map((s, i) => (
             <li key={s.key}>
               <button onClick={() => setActive(s.key)}
                 className={`mb-0.5 flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] ${active === s.key ? "bg-panel2" : "hover:bg-panel"}`}>
@@ -232,6 +244,11 @@ export default function Wizard({ id, resumeRunId, go }: { id: number; resumeRunI
             </li>
           ))}
           <p className="mt-4 px-2 text-[11px] leading-4 text-mute">Ctrl+Enter runs the step. Alt+↑/↓ moves between steps.</p>
+          {repoConfig.length > 0 && (
+            <p className="mt-3 px-2 text-[11px] leading-4 text-accent" title={repoConfig.join(", ")}>
+              release-desk.json applies {repoConfig.length} setting{repoConfig.length === 1 ? "" : "s"}
+            </p>
+          )}
         </ol>
 
         <section className="min-w-0 flex-1 overflow-auto p-5">
@@ -398,7 +415,14 @@ export default function Wizard({ id, resumeRunId, go }: { id: number; resumeRunI
 
           {active === "notes" && (
             <div className="flex h-full min-h-[420px] flex-col gap-3">
-              <NotesEditor value={notes} onChange={setNotes} onRegenerate={() => plan && api.plan(id, { kind: "custom", version: plan.next }).then((p) => setNotes(p.notes))} />
+              <NotesEditor value={notes} onChange={setNotes} onRegenerate={() => plan && api.plan(id, { kind: "custom", version: plan.next }).then((p) => setNotes(p.notes))}
+                onPolish={aiReady ? async () => {
+                  if (!(await nativeAsk("Send these release notes (text only) to the Anthropic API with your key to polish them?", { title: "Polish with AI", kind: "info" }))) return;
+                  setBusy(true);
+                  try { setNotes(await api.polishNotes(notes)); append("Notes", "polished with AI: review before using"); }
+                  catch (e) { append("Notes", `ERROR: ${errText(e)}`); }
+                  finally { setBusy(false); }
+                } : undefined} polishing={busy} />
               <div className="flex justify-end">
                 <Button data-primary variant="primary" disabled={busy || !notes.trim()}
                   onClick={() => exec("notes", (b) => api.notes({ ...b, notes }), "tag")}>Use these notes</Button>

@@ -17,6 +17,9 @@ pub struct Desk {
     pub secrets: Arc<dyn Secrets>,
     /// Overridable for tests (wiremock). None = api.github.com.
     pub api_base: Option<String>,
+    /// Overridable for tests. None = api.anthropic.com.
+    pub ai_base: Option<String>,
+    pub runners: crate::runner::Runners,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -39,6 +42,15 @@ pub fn guard_remote(p: &Project, action: &str) -> Result<()> {
 impl Desk {
     pub fn ctx(&self, dry_run: bool) -> Ctx {
         Ctx::new(dry_run).with_git(self.store.setting("git_path").ok().flatten())
+    }
+
+    /// Stored project with the repo's `release-desk.json` applied on top.
+    pub fn project(&self, id: i64) -> Result<Project> {
+        let mut p = self.store.project(id)?;
+        if let Some(c) = crate::config::load(&Desk::repo(&p))? {
+            crate::config::apply(&mut p, &c)?;
+        }
+        Ok(p)
     }
 
     pub fn repo(p: &Project) -> PathBuf {
@@ -301,13 +313,27 @@ impl Desk {
                 for a in &p.adapters {
                     files.extend(version::plan_write(a, &repo, &v)?.into_iter().map(|e| e.path));
                 }
+                if p.options.changelog {
+                    let f = p.options.changelog_file.clone();
+                    let old = std::fs::read_to_string(repo.join(&f)).unwrap_or_default();
+                    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                    match crate::notes::changelog_insert(&old, &v.to_string(), &date, notes_md) {
+                        Some(new) => {
+                            version::apply_edits(&ctx, &repo, &[version::FileEdit { path: f.clone(), content: new }])?;
+                            files.push(f);
+                        }
+                        None => ctx.log(&format!("{f} already has a section for {v}")),
+                    }
+                }
                 let changed: Vec<String> = {
                     let st = git::status(&ctx, &repo)?;
                     files.into_iter().filter(|f| st.files.iter().any(|c| &c.path == f)).collect()
                 };
-                if !changed.is_empty() || (dry && !p.adapters.iter().all(|a| *a == AdapterConfig::GitTag)) {
+                if !changed.is_empty() || (dry && (p.options.changelog || !p.adapters.iter().all(|a| *a == AdapterConfig::GitTag))) {
                     let to_stage = if changed.is_empty() {
-                        p.adapters.iter().flat_map(|a| version::plan_write(a, &repo, &v).unwrap_or_default()).map(|e| e.path).collect()
+                        let mut f: Vec<String> = p.adapters.iter().flat_map(|a| version::plan_write(a, &repo, &v).unwrap_or_default()).map(|e| e.path).collect();
+                        if p.options.changelog { f.push(p.options.changelog_file.clone()); }
+                        f
                     } else {
                         changed
                     };
@@ -394,6 +420,26 @@ impl Desk {
 }
 
 // ================================================================ Phase 2
+
+/// Files inside an artifact zip, flattened to their base names.
+fn unzip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| Error::Other(format!("artifact zip: {e}")))?;
+    let mut out = vec![];
+    for i in 0..z.len() {
+        let mut f = z.by_index(i).map_err(|e| Error::Other(e.to_string()))?;
+        if f.is_dir() {
+            continue;
+        }
+        let name = f.name().rsplit('/').next().unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let mut buf = vec![];
+        std::io::Read::read_to_end(&mut f, &mut buf)?;
+        out.push((name, buf));
+    }
+    Ok(out)
+}
 
 fn render_input(tpl: &str, version: &str, tag: &str, notes_md: &str) -> String {
     tpl.replace("{version}", version).replace("{tag}", tag).replace("{notes}", notes_md)
@@ -623,6 +669,19 @@ impl Desk {
                     continue;
                 }
                 match &rel {
+                    Some(rel) if !dry && p.options.attach_mode == "files" => {
+                        let bytes = gh.download_artifact(&ctx, &p.owner, &p.repo, a.id).await?;
+                        for (file, data) in unzip(&bytes)? {
+                            if rel.assets.iter().any(|x| x.name == file) {
+                                ctx.log(&format!("{file} already attached"));
+                                skipped.push(file);
+                                continue;
+                            }
+                            gh.upload_asset(&ctx, rel, &file, data).await?;
+                            uploaded.push(file);
+                        }
+                        continue;
+                    }
                     Some(rel) if !dry => {
                         let bytes = gh.download_artifact(&ctx, &p.owner, &p.repo, a.id).await?;
                         gh.upload_asset(&ctx, rel, &name, bytes).await?;
@@ -675,6 +734,23 @@ impl Desk {
             for a in &p.adapters {
                 files.extend(version::plan_write(a, &repo, &v).unwrap_or_default().into_iter().map(|e| e.path));
             }
+            if p.options.changelog {
+                let f = p.options.changelog_file.clone();
+                if git::is_tracked(&ctx, &repo, &f) || release_commit {
+                    files.push(f);
+                }
+            }
+            // Files new in the release commit are not in HEAD after the reset: unstage them instead.
+            let (tracked, new): (Vec<String>, Vec<String>) = files.into_iter().partition(|f| {
+                git::read(&ctx, &repo, &["cat-file", "-e", &format!("HEAD:{f}")]).is_ok()
+            });
+            if !new.is_empty() {
+                let mut args = vec!["reset", "-q", "--"];
+                args.extend(new.iter().map(|s| s.as_str()));
+                git::write(&ctx, &repo, &args)?;
+                ctx.log(&format!("left as untracked (new in this release): {}", new.join(", ")));
+            }
+            let files = tracked;
             if !files.is_empty() {
                 let mut args = vec!["checkout", "HEAD", "--"];
                 args.extend(files.iter().map(|s| s.as_str()));

@@ -64,7 +64,7 @@ fn desk(api: Option<String>) -> Desk {
     secrets.set("acc", TOKEN).unwrap();
     let store = Store::memory().unwrap();
     store.add_account("personal", "tester", "acc").unwrap();
-    Desk { store, secrets, api_base: api }
+    Desk { store, secrets, api_base: api, ai_base: None, runners: Default::default() }
 }
 
 /// Snapshot of everything a release could change.
@@ -342,6 +342,7 @@ async fn dispatch_and_attach_artifacts() {
     p.options.workflow = Some("release.yml".into());
     p.options.dispatch = true;
     p.options.dispatch_inputs.insert("title".into(), "Release {tag}".into());
+    p.options.attach_mode = "zip".into();
     let pid = d.store.add_project(&p).unwrap();
     let p = d.store.project(pid).unwrap();
 
@@ -445,4 +446,73 @@ async fn resume_collects_state() {
     assert_eq!(d.store.run(run).unwrap().status, "running");
     assert!(d.step_publish(Some(run), &p, false, 77).await.ok);
     assert_eq!(d.store.run(run).unwrap().status, "done");
+}
+
+fn make_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut z = zip::ZipWriter::new(&mut buf);
+        for (n, d) in files {
+            z.start_file(*n, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut z, d).unwrap();
+        }
+        z.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+#[tokio::test]
+async fn attach_uploads_files_inside_artifacts() {
+    let fx = fixture();
+    let gh = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/repos/o/r/actions/runs/900/artifacts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "artifacts": [ { "id": 1, "name": "windows-installer", "size_in_bytes": 9 } ] })))
+        .mount(&gh).await;
+    Mock::given(method("GET")).and(path("/repos/o/r/actions/artifacts/1/zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(make_zip(&[
+            ("bundle/msi/App_1.1.0_x64_en-US.msi", b"MSI"), ("bundle/nsis/App_1.1.0_x64-setup.exe", b"EXE"), ("latest.json", b"{}")])))
+        .mount(&gh).await;
+    Mock::given(method("GET")).and(path("/repos/o/r/releases/77"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 77, "tag_name": "v1.1.0", "html_url": "",
+            "draft": true, "prerelease": false, "upload_url": format!("{}/upload/77/assets{{?name,label}}", gh.uri()),
+            "assets": [ { "id": 9, "name": "latest.json" } ] })))
+        .mount(&gh).await;
+    Mock::given(method("POST")).and(path("/upload/77/assets"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 10 }))).expect(2).mount(&gh).await;
+    let d = desk(Some(gh.uri()));
+    let pid = d.store.add_project(&project(&fx, false)).unwrap();
+    let p = d.store.project(pid).unwrap();
+    assert_eq!(p.options.attach_mode, "files");
+    let a = d.step_attach(None, &p, false, 77, 900).await;
+    assert!(a.ok, "{}", a.log);
+    assert_eq!(a.meta["uploaded"], json!(["App_1.1.0_x64_en-US.msi", "App_1.1.0_x64-setup.exe"]));
+    assert_eq!(a.meta["skipped"], json!(["latest.json"]));
+    gh.verify().await;
+}
+
+#[test]
+fn changelog_in_release_commit_and_repo_config() {
+    let fx = fixture();
+    // The repo file switches the changelog on and changes the tag format.
+    std::fs::write(fx.work.join("release-desk.json"), r#"{"tag_format": "rel-{version}", "options": {"changelog": true}}"#).unwrap();
+    sh(&fx.work, &["add", "release-desk.json"]);
+    sh(&fx.work, &["commit", "-q", "-m", "chore: add release-desk.json"]);
+    let d = desk(None);
+    let pid = d.store.add_project(&project(&fx, true)).unwrap();
+    let p = d.project(pid).unwrap();
+    assert_eq!(p.tag_format, "rel-{version}");
+    assert!(p.options.changelog);
+    assert!(d.step_version(None, &p, false, "1.1.0").ok);
+    let t = d.step_tag(None, &p, false, "1.1.0", "### Features\n\n- a\n");
+    assert!(t.ok, "{}", t.log);
+    let files = sh(&fx.work, &["show", "--name-only", "--format=", "HEAD"]);
+    assert!(files.contains("CHANGELOG.md") && files.contains("package.json"), "{files}");
+    assert!(sh(&fx.work, &["tag", "-l"]).contains("rel-1.1.0"));
+    let cl = std::fs::read_to_string(fx.work.join("CHANGELOG.md")).unwrap();
+    assert!(cl.contains("## [1.1.0] - ") && cl.contains("\n### Features\n"));
+    // Rollback removes the commit; the new changelog is left untracked, not deleted.
+    let r = d.rollback(None, &p, false, "1.1.0");
+    assert!(r.ok, "{}", r.log);
+    assert_eq!(sh(&fx.work, &["log", "-1", "--format=%s"]), "chore: add release-desk.json");
+    assert!(sh(&fx.work, &["status", "--porcelain"]).contains("?? CHANGELOG.md"));
 }

@@ -4,6 +4,7 @@ import AddProject from "./pages/AddProject";
 import Wizard from "./pages/Wizard";
 import History from "./pages/History";
 import Settings from "./pages/Settings";
+import Runners from "./pages/Runners";
 
 export type Route =
   | { page: "dashboard" }
@@ -11,12 +12,14 @@ export type Route =
   | { page: "edit"; id: number }
   | { page: "wizard"; id: number; runId?: number }
   | { page: "history"; id?: number }
+  | { page: "runners" }
   | { page: "settings" };
 
 const NAV: { key: Route["page"]; label: string; hotkey: string }[] = [
   { key: "dashboard", label: "Projects", hotkey: "1" },
   { key: "history", label: "History", hotkey: "2" },
-  { key: "settings", label: "Settings", hotkey: "3" },
+  { key: "runners", label: "Runners", hotkey: "3" },
+  { key: "settings", label: "Settings", hotkey: "4" },
 ];
 
 export default function App() {
@@ -67,6 +70,7 @@ export default function App() {
         {route.page === "edit" && <AddProject go={setRoute} editId={route.id} />}
         {route.page === "wizard" && <Wizard key={`${route.id}-${route.runId ?? ""}`} id={route.id} resumeRunId={route.runId} go={setRoute} />}
         {route.page === "history" && <History projectId={route.id} go={setRoute} />}
+        {route.page === "runners" && <Runners />}
         {route.page === "settings" && <Settings />}
       </main>
     </div>
