@@ -36,7 +36,8 @@ pub fn guard_remote(p: &Project, action: &str) -> Result<()> {
     if p.local_only {
         return Err(Error::Blocked(format!("'{}' is local-only: {action} is disabled", p.name)));
     }
-    Ok(())
+    // owner/repo go into API URL paths: refuse anything that could redirect a request.
+    crate::safety::slug(&p.owner, &p.repo)
 }
 
 impl Desk {
@@ -205,10 +206,20 @@ pub struct Plan {
 pub fn plan(ctx: &Ctx, p: &Project, bump: &Bump) -> Result<Plan> {
     let repo = Desk::repo(p);
     let cur = current_version(ctx, p)?;
-    let prev_tag = git::last_tag(ctx, &repo, &version::tag_glob(&p.tag_format));
-    let commits = notes::parse_all(&git::commits_since(ctx, &repo, prev_tag.as_deref())?);
+    let glob = version::tag_glob(&p.tag_format);
+    let mut prev_tag = git::last_tag(ctx, &repo, &glob);
+    let mut commits = notes::parse_all(&git::commits_since(ctx, &repo, prev_tag.as_deref())?);
     let next = version::next_version(&cur, bump, &commits)?;
     let tag = version::render_tag(&p.tag_format, &next);
+    // Releasing a tag that already exists (e.g. publishing after the tag was
+    // pushed): notes cover the previous tag up to this one, not "since this tag".
+    if git::tag_exists(ctx, &repo, &tag) {
+        prev_tag = git::read(ctx, &repo, &["describe", "--tags", "--abbrev=0", "--match", &glob, &format!("{tag}^")])
+            .ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let raw = git::read(ctx, &repo, &["log", &match &prev_tag { Some(pt) => format!("{pt}..{tag}"), None => tag.clone() },
+            "--format=%H%x1f%an%x1f%s%x1f%b%x1e"]).unwrap_or_default();
+        commits = notes::parse_all(&git::parse_log(&raw));
+    }
     let mut edits = vec![];
     for a in &p.adapters {
         edits.extend(version::plan_write(a, &repo, &next)?);
@@ -234,11 +245,16 @@ pub fn plan(ctx: &Ctx, p: &Project, bump: &Bump) -> Result<Plan> {
 
 impl Desk {
     pub fn step_commit(&self, run: Option<i64>, p: &Project, dry: bool, files: &[String], message: &str) -> StepOutcome {
+        self.step_commit_checked(run, p, dry, files, message, false)
+    }
+
+    /// Commit selected files. Secret-looking files need `allow_secrets`.
+    pub fn step_commit_checked(&self, run: Option<i64>, p: &Project, dry: bool, files: &[String], message: &str, allow_secrets: bool) -> StepOutcome {
         let ctx = self.ctx(dry);
         let started = now();
         let r = (|| {
             let repo = Desk::repo(p);
-            git::stage(&ctx, &repo, files)?;
+            git::stage_checked(&ctx, &repo, files, allow_secrets)?;
             git::commit(&ctx, &repo, message)?;
             Ok(json!({ "files": files, "message": message }))
         })();
@@ -315,7 +331,7 @@ impl Desk {
                 }
                 if p.options.changelog {
                     let f = p.options.changelog_file.clone();
-                    let old = std::fs::read_to_string(repo.join(&f)).unwrap_or_default();
+                    let old = std::fs::read_to_string(crate::safety::repo_path(&repo, &f)?).unwrap_or_default();
                     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
                     match crate::notes::changelog_insert(&old, &v.to_string(), &date, notes_md) {
                         Some(new) => {
@@ -372,6 +388,7 @@ impl Desk {
             guard_remote(p, "GitHub release")?;
             let v = Version::parse(next.trim_start_matches('v')).map_err(|e| Error::Version(e.to_string()))?;
             let tag = version::render_tag(&p.tag_format, &v);
+            crate::safety::git_ref(&tag)?;
             let Some((acc, gh)) = self.client_for(p)? else {
                 if dry {
                     ctx.log(&format!("[dry-run] would POST /repos/{}/{}/releases (no account configured)", p.owner, p.repo));
@@ -430,7 +447,14 @@ impl Desk {
 
 /// Files inside an artifact zip, flattened to their base names.
 fn unzip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    // Guards against zip bombs: GitHub release assets are capped at 2 GiB anyway.
+    const MAX_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
+    const MAX_FILES: usize = 1000;
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| Error::Other(format!("artifact zip: {e}")))?;
+    if z.len() > MAX_FILES {
+        return Err(Error::Blocked(format!("artifact has {} entries (limit {MAX_FILES})", z.len())));
+    }
+    let mut total: u64 = 0;
     let mut out = vec![];
     for i in 0..z.len() {
         let mut f = z.by_index(i).map_err(|e| Error::Other(e.to_string()))?;
@@ -443,8 +467,17 @@ fn unzip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
         if name.is_empty() {
             continue;
         }
-        let mut buf = vec![];
-        std::io::Read::read_to_end(&mut f, &mut buf)?;
+        let declared = f.size();
+        total += declared;
+        if total > MAX_TOTAL {
+            return Err(Error::Blocked("artifact unpacks to more than 2 GiB".into()));
+        }
+        let mut buf = Vec::with_capacity(declared.min(64 * 1024 * 1024) as usize);
+        // Read at most the declared size + 1 byte, so a lying header cannot inflate past it.
+        std::io::Read::read_to_end(&mut std::io::Read::take(&mut f, declared + 1), &mut buf)?;
+        if buf.len() as u64 > declared {
+            return Err(Error::Blocked(format!("artifact entry {name} is larger than its header says")));
+        }
         out.push((name, buf));
     }
     Ok(out)
@@ -604,6 +637,7 @@ impl Desk {
             guard_remote(p, "workflow dispatch")?;
             let wf = p.options.workflow.clone().filter(|w| !w.trim().is_empty())
                 .ok_or_else(|| Error::Other("no workflow set for this project (Edit project)".into()))?;
+            crate::safety::workflow(&wf)?;
             let v = parse_next(next)?;
             let tag = version::render_tag(&p.tag_format, &v);
             let inputs: serde_json::Map<String, Value> = p.options.dispatch_inputs.iter()

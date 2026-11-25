@@ -86,9 +86,9 @@ pub fn finish_run(desk: D, run_id: i64, status: String) -> Result<()> {
 }
 
 #[tauri::command]
-pub fn run_commit(desk: D, run_id: Option<i64>, id: i64, dry_run: bool, files: Vec<String>, message: String) -> Result<StepOutcome> {
+pub fn run_commit(desk: D, run_id: Option<i64>, id: i64, dry_run: bool, files: Vec<String>, message: String, allowSecrets: Option<bool>) -> Result<StepOutcome> {
     let p = desk.project(id)?;
-    Ok(desk.step_commit(run_id, &p, dry_run, &files, &message))
+    Ok(desk.step_commit_checked(run_id, &p, dry_run, &files, &message, allowSecrets.unwrap_or(false)))
 }
 
 #[tauri::command]

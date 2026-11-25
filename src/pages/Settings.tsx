@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { Account, api, DeviceCode, errText, openUrl } from "../lib/api";
 import { Button, Card, Field, inputCls } from "../components/ui";
@@ -17,6 +17,9 @@ export default function Settings() {
   const [busy, setBusy] = useState(false);
   const [clientId, setClientId] = useState("");
   const [device, setDevice] = useState<DeviceCode | null>(null);
+  // Stops the device-flow polling loop when the page closes or the user cancels.
+  const polling = useRef(false);
+  useEffect(() => () => { polling.current = false; }, []);
   const [aiKey, setAiKey] = useState("");
   const [aiModel, setAiModel] = useState("");
   const [aiSet, setAiSet] = useState(false);
@@ -48,7 +51,8 @@ export default function Settings() {
       await openUrl(d.verification_uri);
       let interval = d.interval;
       const deadline = Date.now() + d.expires_in * 1000;
-      while (Date.now() < deadline) {
+      polling.current = true;
+      while (Date.now() < deadline && polling.current) {
         await new Promise((r) => setTimeout(r, interval * 1000));
         const r = await api.devicePoll(d.device_code, interval, label);
         if (r.state === "done") {
@@ -58,7 +62,7 @@ export default function Settings() {
         }
         interval = r.interval;
       }
-      setErr("The code expired. Start again.");
+      if (polling.current) setErr("The code expired. Start again.");
     } catch (e) {
       setErr(errText(e));
     }
@@ -144,6 +148,7 @@ export default function Settings() {
               Enter this code at <button className="text-accent underline" onClick={() => openUrl(device.verification_uri)}>{device.verification_uri}</button>:
               <div className="my-2 font-mono text-2xl tracking-widest">{device.user_code}</div>
               <span className="text-xs text-mute">Waiting for approval… (the label above is used for the account)</span>
+              <Button className="ml-3" onClick={() => { polling.current = false; setDevice(null); }}>Cancel</Button>
             </div>
           )}
         </div>

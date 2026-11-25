@@ -6,3 +6,12 @@ src-tauri/gen/
 .env
 .env.*
 tsconfig.tsbuildinfo
+
+# Secrets: never commit keys
+*.key
+*.key.pub
+*.pem
+*.p12
+*.pfx
+%USERPROFILE%/
+_to_delete/

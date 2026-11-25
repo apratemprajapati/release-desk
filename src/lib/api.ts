@@ -152,7 +152,7 @@ export const api = {
   startRun: (id: number, dryRun: boolean) =>
     invoke<{ run_id: number; account: Account | null }>("start_run", { id, dryRun }),
   finishRun: (runId: number, status: string) => invoke<void>("finish_run", { runId, status }),
-  commit: (a: Base & { files: string[]; message: string }) => invoke<StepOutcome>("run_commit", a),
+  commit: (a: Base & { files: string[]; message: string; allowSecrets?: boolean }) => invoke<StepOutcome>("run_commit", a),
   push: (a: Base) => invoke<StepOutcome>("run_push", a),
   version: (a: Base & { next: string }) => invoke<StepOutcome>("run_version", a),
   notes: (a: Base & { notes: string }) => invoke<StepOutcome>("run_notes", a),
@@ -191,6 +191,10 @@ export const api = {
 };
 
 export type Base = { runId: number | null; id: number; dryRun: boolean };
+
+/** Mirrors safety::looks_secret in Rust (the backend enforces it; this is for the UI). */
+const SECRET_RE = /(^|\/)(\.env(\..+)?|.*\.(key|pem|p12|pfx|jks|keystore|ppk|asc|gpg|kdbx)|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|.*\.key\.pub|credentials(\.json)?|\.npmrc|\.pypirc|\.netrc|.*secret.*|.*\.tfstate(\.backup)?)$/i;
+export const looksSecret = (path: string) => SECRET_RE.test(path.replace(/\\/g, "/"));
 
 export const errText = (e: unknown) => (typeof e === "string" ? e : (e as Error)?.message ?? String(e));
 

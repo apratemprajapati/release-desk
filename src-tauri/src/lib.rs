@@ -8,6 +8,7 @@ pub mod notes;
 pub mod pipeline;
 pub mod redact;
 pub mod runner;
+pub mod safety;
 pub mod store;
 pub mod version;
 
@@ -84,6 +85,13 @@ pub fn run() {
             commands::set_ai_key,
             commands::polish_notes,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Release Desk");
+        .build(tauri::generate_context!())
+        .expect("error while building Release Desk")
+        .run(|app, event| {
+            // Runners started from the app run hidden: stop them when the app quits
+            // so none are left running with no way to control them.
+            if let tauri::RunEvent::Exit = event {
+                app.state::<pipeline::Desk>().runners.stop_all();
+            }
+        });
 }
