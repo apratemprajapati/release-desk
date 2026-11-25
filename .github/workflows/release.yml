@@ -1,0 +1,71 @@
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      version: { required: true, type: string }
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    env:
+      # Optional. With both set, the build also produces signed updater files and latest.json.
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: src-tauri }
+      - run: npm ci
+
+      - name: Build installers
+        shell: pwsh
+        run: |
+          if ($env:TAURI_SIGNING_PRIVATE_KEY -and $env:UPDATER_PUBKEY) {
+            $cfg = @{ bundle = @{ createUpdaterArtifacts = $true }; plugins = @{ updater = @{ pubkey = $env:UPDATER_PUBKEY } } } | ConvertTo-Json -Depth 5 -Compress
+            Set-Content -Path updater.conf.json -Value $cfg
+            npx tauri build --config updater.conf.json
+          } else {
+            Write-Host "No signing key: building installers without updater artifacts"
+            npx tauri build
+          }
+
+      - name: Collect files
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory -Force dist-release
+          $b = "src-tauri/target/release/bundle"
+          Get-ChildItem "$b/msi/*.msi", "$b/nsis/*.exe", "$b/msi/*.sig", "$b/nsis/*.sig" -ErrorAction SilentlyContinue | Copy-Item -Destination $out
+          $exe = Get-ChildItem "$b/nsis/*-setup.exe" | Select-Object -First 1
+          $sig = Get-ChildItem "$b/nsis/*-setup.exe.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($sig) {
+            $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+            $tag = "v$version"
+            $latest = @{
+              version = $version
+              notes = "See the release notes on GitHub."
+              pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+              platforms = @{ "windows-x86_64" = @{
+                signature = (Get-Content $sig.FullName -Raw).Trim()
+                url = "https://github.com/${{ github.repository }}/releases/download/$tag/$($exe.Name)"
+              } }
+            } | ConvertTo-Json -Depth 5
+            Set-Content -Path "$out/latest.json" -Value $latest
+          }
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist-release/*
+          if-no-files-found: error
