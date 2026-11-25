@@ -1,3 +1,4 @@
+#![allow(non_snake_case)] // camelCase args match the JS invoke keys
 //! `#[tauri::command]` surface. Thin: every rule (local-only, dry-run,
 //! redaction) lives in the core so it holds no matter what the UI sends.
 use crate::error::{Error, Result};
@@ -140,7 +141,10 @@ pub fn list_accounts(desk: D) -> Result<Vec<Account>> {
 /// a reference in SQLite. The token never comes back to the UI.
 #[tauri::command]
 pub async fn add_account(desk: D<'_>, label: String, token: String) -> Result<Account> {
-    let token = token.trim().to_string();
+    save_account(&desk, label, token.trim().to_string()).await
+}
+
+async fn save_account(desk: &Desk, label: String, token: String) -> Result<Account> {
     let gh = Client::new(desk.api_base.as_deref(), &token)?;
     let login = gh.whoami(&desk.ctx(false)).await?;
     let key = format!("account:{}:{}", login, chrono::Utc::now().timestamp());
@@ -161,6 +165,7 @@ pub fn remove_account(desk: D, id: i64) -> Result<()> {
 pub struct Settings {
     pub git_path: String,
     pub default_tag_format: String,
+    pub oauth_client_id: String,
 }
 
 #[tauri::command]
@@ -168,13 +173,119 @@ pub fn get_settings(desk: D) -> Result<Settings> {
     Ok(Settings {
         git_path: desk.store.setting("git_path")?.unwrap_or_default(),
         default_tag_format: desk.store.setting("default_tag_format")?.unwrap_or_else(|| "v{version}".into()),
+        oauth_client_id: desk.store.setting("oauth_client_id")?.unwrap_or_default(),
     })
 }
 
 #[tauri::command]
 pub fn set_setting(desk: D, key: String, value: String) -> Result<()> {
-    if !["git_path", "default_tag_format"].contains(&key.as_str()) {
+    if !["git_path", "default_tag_format", "oauth_client_id"].contains(&key.as_str()) {
         return Err(Error::Other(format!("unknown setting {key}")));
     }
     desk.store.set_setting(&key, &value)
+}
+
+// ================================================================ Phase 2
+
+#[tauri::command]
+pub async fn open_pr(desk: D<'_>, run_id: Option<i64>, id: i64, dry_run: bool, title: String, body: String) -> Result<StepOutcome> {
+    let p = desk.store.project(id)?;
+    Ok(desk.step_open_pr(run_id, &p, dry_run, &title, &body).await)
+}
+
+#[tauri::command]
+pub async fn pr_status(desk: D<'_>, id: i64, number: u64) -> Result<pipeline::PrStatus> {
+    let p = desk.store.project(id)?;
+    desk.pr_status(&p, number).await
+}
+
+#[tauri::command]
+pub async fn merge_pr(desk: D<'_>, run_id: Option<i64>, id: i64, dry_run: bool, number: u64, allowFailing: bool) -> Result<StepOutcome> {
+    let p = desk.store.project(id)?;
+    Ok(desk.step_merge_pr(run_id, &p, dry_run, number, allowFailing).await)
+}
+
+#[tauri::command]
+pub fn merge_ff(desk: D, run_id: Option<i64>, id: i64, dry_run: bool) -> Result<StepOutcome> {
+    let p = desk.store.project(id)?;
+    Ok(desk.step_merge_ff(run_id, &p, dry_run))
+}
+
+#[tauri::command]
+pub async fn list_workflows(desk: D<'_>, id: i64) -> Result<Vec<crate::github::Workflow>> {
+    let p = desk.store.project(id)?;
+    pipeline::guard_remote(&p, "Actions")?;
+    let (_, gh) = desk.client_for(&p)?.ok_or_else(|| Error::GitHub("no GitHub account configured".into()))?;
+    gh.workflows(&desk.ctx(false), &p.owner, &p.repo).await
+}
+
+#[tauri::command]
+pub async fn dispatch(desk: D<'_>, run_id: Option<i64>, id: i64, dry_run: bool, next: String, notes: String) -> Result<StepOutcome> {
+    let p = desk.store.project(id)?;
+    Ok(desk.step_dispatch(run_id, &p, dry_run, &next, &notes).await)
+}
+
+#[tauri::command]
+pub async fn actions_runs(desk: D<'_>, id: i64, gitRef: Option<String>) -> Result<Vec<crate::github::WorkflowRun>> {
+    let p = desk.store.project(id)?;
+    desk.actions_runs(&p, gitRef.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn actions_jobs(desk: D<'_>, id: i64, runId: u64) -> Result<Vec<crate::github::Job>> {
+    let p = desk.store.project(id)?;
+    desk.actions_jobs(&p, runId).await
+}
+
+#[tauri::command]
+pub async fn actions_control(desk: D<'_>, run_id: Option<i64>, id: i64, dry_run: bool, actionsRun: u64, action: String) -> Result<StepOutcome> {
+    let p = desk.store.project(id)?;
+    Ok(desk.actions_control(run_id, &p, dry_run, actionsRun, &action).await)
+}
+
+#[tauri::command]
+pub async fn attach(desk: D<'_>, run_id: Option<i64>, id: i64, dry_run: bool, releaseId: u64, actionsRun: u64) -> Result<StepOutcome> {
+    let p = desk.store.project(id)?;
+    Ok(desk.step_attach(run_id, &p, dry_run, releaseId, actionsRun).await)
+}
+
+#[tauri::command]
+pub fn rollback(desk: D, run_id: Option<i64>, id: i64, dry_run: bool, next: String) -> Result<StepOutcome> {
+    let p = desk.store.project(id)?;
+    Ok(desk.rollback(run_id, &p, dry_run, &next))
+}
+
+#[tauri::command]
+pub fn resume_info(desk: D, runId: i64) -> Result<pipeline::ResumeInfo> {
+    desk.resume_info(runId)
+}
+
+fn client_id(desk: &Desk) -> Result<String> {
+    desk.store.setting("oauth_client_id")?.filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| Error::Other("set the OAuth App client ID in Settings first".into()))
+}
+
+#[tauri::command]
+pub async fn device_start(desk: D<'_>) -> Result<crate::github::DeviceCode> {
+    crate::github::device_start(None, &client_id(&desk)?, "repo workflow").await
+}
+
+#[derive(Serialize)]
+pub struct DeviceResult {
+    pub state: String,
+    pub interval: u64,
+    pub account: Option<Account>,
+}
+
+/// Poll once. The token goes straight from GitHub into the keychain; only the
+/// account record comes back to the UI.
+#[tauri::command]
+pub async fn device_poll(desk: D<'_>, deviceCode: String, interval: u64, label: String) -> Result<DeviceResult> {
+    match crate::github::device_poll(None, &client_id(&desk)?, &deviceCode, interval).await? {
+        crate::github::DevicePoll::Pending { interval } => Ok(DeviceResult { state: "pending".into(), interval, account: None }),
+        crate::github::DevicePoll::Done { token } => {
+            let a = save_account(&desk, label, token).await?;
+            Ok(DeviceResult { state: "done".into(), interval, account: Some(a) })
+        }
+    }
 }

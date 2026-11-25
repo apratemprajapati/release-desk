@@ -1,12 +1,18 @@
 import { useEffect, useState } from "react";
 import { open, ask } from "@tauri-apps/plugin-dialog";
-import { Account, Adapter, api, errText, Project } from "../lib/api";
+import { Account, Adapter, api, defaultOptions, errText, Project, ProjectOptions } from "../lib/api";
 import { Badge, Button, Card, Field, inputCls } from "../components/ui";
 import type { Route } from "../App";
 
 const blank: Project = {
   id: 0, name: "", path: "", owner: "", repo: "", account_id: null, default_branch: "main",
   release_branch: "main", tag_format: "v{version}", local_only: false, adapters: [], pipeline: [],
+  options: defaultOptions(),
+};
+
+const DEFAULT_FILE: Record<string, string> = {
+  npm: "package.json", "plain-file": "VERSION", cargo: "Cargo.toml", python: "pyproject.toml",
+  tauri: "src-tauri/tauri.conf.json", android: "app/build.gradle.kts",
 };
 
 export default function AddProject({ go, editId }: { go: (r: Route) => void; editId?: number }) {
@@ -14,11 +20,23 @@ export default function AddProject({ go, editId }: { go: (r: Route) => void; edi
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [note, setNote] = useState<string[]>([]);
   const [err, setErr] = useState("");
+  const [workflows, setWorkflows] = useState<string[]>([]);
+  const [inputsText, setInputsText] = useState("version={version}");
   const set = (patch: Partial<Project>) => setP((x) => ({ ...x, ...patch }));
+  const setOpt = (patch: Partial<ProjectOptions>) => setP((x) => ({ ...x, options: { ...x.options, ...patch } }));
+  const parseInputs = (t: string) =>
+    Object.fromEntries(t.split("\n").map((l) => l.trim()).filter((l) => l.includes("=")).map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()]));
 
   useEffect(() => {
     api.accounts().then(setAccounts);
-    if (editId) api.listProjects().then((ps) => setP(ps.find((x) => x.id === editId) ?? blank));
+    if (editId)
+      api.listProjects().then((ps) => {
+        const found = ps.find((x) => x.id === editId) ?? blank;
+        const options = { ...defaultOptions(), ...found.options };
+        setP({ ...found, options });
+        setInputsText(Object.entries(options.dispatch_inputs).map(([k, v]) => `${k}=${v}`).join("\n"));
+        api.detectProject(found.path).then((d) => setWorkflows(d.workflows)).catch(() => {});
+      });
     else api.settings().then((s) => set({ tag_format: s.default_tag_format }));
   }, [editId]);
 
@@ -33,10 +51,12 @@ export default function AddProject({ go, editId }: { go: (r: Route) => void; edi
       else if (!d.owner) n.push(`Remote ${d.remote_url} is not on GitHub: releases will be unavailable.`);
       if (d.has_claude_md_push_ban) n.push("CLAUDE.md in this repo forbids pushing: local-only is switched on.");
       if (d.workflows.length) n.push(`Workflows found: ${d.workflows.join(", ")}`);
+      setWorkflows(d.workflows);
       setNote(n);
       set({
         name: d.name, path: d.path, owner: d.owner, repo: d.repo, default_branch: d.default_branch,
         release_branch: d.default_branch, adapters: d.adapters,
+        options: { ...defaultOptions(), workflow: d.workflows.find((w) => /release/i.test(w)) ?? null },
         local_only: d.has_claude_md_push_ban || !d.owner,
       });
     } catch (e) {
@@ -47,8 +67,9 @@ export default function AddProject({ go, editId }: { go: (r: Route) => void; edi
   async function save() {
     setErr("");
     try {
-      if (editId) await api.updateProject(p);
-      else await api.addProject(p);
+      const full = { ...p, options: { ...p.options, dispatch_inputs: parseInputs(inputsText) } };
+      if (editId) await api.updateProject(full);
+      else await api.addProject(full);
       go({ page: "dashboard" });
     } catch (e) {
       setErr(errText(e));
@@ -106,7 +127,7 @@ export default function AddProject({ go, editId }: { go: (r: Route) => void; edi
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-xs font-medium text-mute">Version files (the first one is the source of truth)</span>
                 <div className="flex gap-1">
-                  {(["npm", "plain-file", "regex", "git-tag"] as const).map((k) => (
+                  {(["npm", "cargo", "python", "tauri", "android", "plain-file", "regex", "git-tag"] as const).map((k) => (
                     <Button key={k} className="!px-2 !py-0.5 text-xs" onClick={() =>
                       set({ adapters: [...p.adapters, k === "regex" ? { kind: k, file: "", pattern: "" } : ({ kind: k } as Adapter)] })
                     }>+ {k}</Button>
@@ -117,8 +138,8 @@ export default function AddProject({ go, editId }: { go: (r: Route) => void; edi
                 {p.adapters.map((a, i) => (
                   <div key={i} className="flex items-center gap-2 rounded-md border border-line bg-bg p-2">
                     <Badge tone="accent">{a.kind}</Badge>
-                    {(a.kind === "npm" || a.kind === "plain-file") && (
-                      <input className={inputCls} placeholder={a.kind === "npm" ? "package.json" : "VERSION"}
+                    {a.kind !== "regex" && a.kind !== "git-tag" && (
+                      <input className={inputCls} placeholder={DEFAULT_FILE[a.kind]}
                         value={a.file ?? ""} onChange={(e) => setAdapter(i, { ...a, file: e.target.value || null })} />
                     )}
                     {a.kind === "regex" && (
@@ -134,6 +155,44 @@ export default function AddProject({ go, editId }: { go: (r: Route) => void; edi
                   </div>
                 ))}
               </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4 border-t border-line pt-4">
+              <Field label="Merge before release" hint="PR needs a GitHub account; fast-forward is local only">
+                <select className={inputCls} value={p.options.merge_mode} onChange={(e) => setOpt({ merge_mode: e.target.value as any })}>
+                  <option value="none">None: release from the current branch</option>
+                  <option value="pr" disabled={p.local_only}>Pull request, wait for checks, merge</option>
+                  <option value="ff">Local fast-forward into default branch</option>
+                </select>
+              </Field>
+              <Field label="PR merge method">
+                <select className={inputCls} value={p.options.merge_method} disabled={p.options.merge_mode !== "pr"}
+                  onChange={(e) => setOpt({ merge_method: e.target.value as any })}>
+                  <option value="squash">squash</option><option value="merge">merge commit</option><option value="rebase">rebase</option>
+                </select>
+              </Field>
+              <Field label="Release workflow" hint="File in .github/workflows">
+                <input className={inputCls} list="wf" value={p.options.workflow ?? ""} placeholder="release.yml"
+                  onChange={(e) => setOpt({ workflow: e.target.value || null })} />
+                <datalist id="wf">{workflows.map((w) => <option key={w} value={w} />)}</datalist>
+              </Field>
+              <Field label="Trigger">
+                <select className={inputCls} value={p.options.dispatch ? "dispatch" : "tag"} onChange={(e) => setOpt({ dispatch: e.target.value === "dispatch" })}>
+                  <option value="tag">Tag push starts the workflow</option>
+                  <option value="dispatch">Call workflow_dispatch from the app</option>
+                </select>
+              </Field>
+              {p.options.dispatch && (
+                <Field label="Dispatch inputs (one name=value per line)" hint="Values can use {version}, {tag}, {notes}. Names must match the workflow's inputs.">
+                  <textarea className={`${inputCls} h-16 font-mono`} value={inputsText} onChange={(e) => setInputsText(e.target.value)} />
+                </Field>
+              )}
+              <Field label="Release assets">
+                <label className="flex items-center gap-2 py-1.5">
+                  <input type="checkbox" checked={p.options.attach_artifacts} onChange={(e) => setOpt({ attach_artifacts: e.target.checked })} />
+                  <span>Attach the workflow run's artifacts as .zip files</span>
+                </label>
+              </Field>
             </div>
           </>
         )}

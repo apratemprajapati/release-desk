@@ -4,7 +4,25 @@ export type Adapter =
   | { kind: "npm"; file?: string | null }
   | { kind: "plain-file"; file?: string | null }
   | { kind: "regex"; file: string; pattern: string }
-  | { kind: "git-tag" };
+  | { kind: "git-tag" }
+  | { kind: "cargo"; file?: string | null }
+  | { kind: "python"; file?: string | null }
+  | { kind: "tauri"; file?: string | null }
+  | { kind: "android"; file?: string | null };
+
+export interface ProjectOptions {
+  merge_mode: "none" | "pr" | "ff";
+  merge_method: "merge" | "squash" | "rebase";
+  workflow: string | null;
+  dispatch: boolean;
+  dispatch_inputs: Record<string, string>;
+  attach_artifacts: boolean;
+}
+
+export const defaultOptions = (): ProjectOptions => ({
+  merge_mode: "none", merge_method: "squash", workflow: null, dispatch: false,
+  dispatch_inputs: { version: "{version}" }, attach_artifacts: true,
+});
 
 export interface Project {
   id: number;
@@ -19,6 +37,7 @@ export interface Project {
   local_only: boolean;
   adapters: Adapter[];
   pipeline: string[];
+  options: ProjectOptions;
 }
 
 export interface Detected {
@@ -74,7 +93,27 @@ export interface Run {
   id: number; project_id: number; from_version: string; to_version: string; status: string;
   dry_run: boolean; started_at: string; finished_at: string | null; steps: Step[];
 }
-export interface Settings { git_path: string; default_tag_format: string }
+export interface Settings { git_path: string; default_tag_format: string; oauth_client_id: string }
+
+export interface CheckRun { name: string; status: string; conclusion: string | null; html_url: string | null }
+export interface Pr {
+  number: number; html_url: string; state: string; merged: boolean; mergeable: boolean | null;
+  mergeable_state: string | null; head: { ref: string; sha: string }; base: { ref: string; sha: string };
+}
+export interface PrStatus { pr: Pr; checks: { total: number; pending: number; passed: number; failed: number; runs: CheckRun[] } }
+export interface Workflow { id: number; name: string; path: string; state: string }
+export interface WorkflowRun {
+  id: number; name: string | null; run_number: number; event: string; status: string | null; conclusion: string | null;
+  html_url: string; head_branch: string | null; head_sha: string; created_at: string;
+}
+export interface JobStep { name: string; status: string; conclusion: string | null; number: number }
+export interface Job { id: number; name: string; status: string; conclusion: string | null; html_url: string | null; steps: JobStep[] }
+export interface ResumeInfo {
+  run_id: number; project_id: number; dry_run: boolean; status: string; from_version: string; to_version: string;
+  notes: string | null; pr_number: number | null; release_id: number | null; actions_run_id: number | null;
+  steps: Record<string, string>;
+}
+export interface DeviceCode { device_code: string; user_code: string; verification_uri: string; expires_in: number; interval: number }
 
 export const api = {
   detectProject: (path: string) => invoke<Detected>("detect_project", { path }),
@@ -102,8 +141,25 @@ export const api = {
   removeAccount: (id: number) => invoke<void>("remove_account", { id }),
   settings: () => invoke<Settings>("get_settings"),
   setSetting: (key: string, value: string) => invoke<void>("set_setting", { key, value }),
+  openPr: (a: Base & { title: string; body: string }) => invoke<StepOutcome>("open_pr", a),
+  prStatus: (id: number, number: number) => invoke<PrStatus>("pr_status", { id, number }),
+  mergePr: (a: Base & { number: number; allowFailing: boolean }) => invoke<StepOutcome>("merge_pr", a),
+  mergeFf: (a: Base) => invoke<StepOutcome>("merge_ff", a),
+  workflows: (id: number) => invoke<Workflow[]>("list_workflows", { id }),
+  dispatch: (a: Base & { next: string; notes: string }) => invoke<StepOutcome>("dispatch", a),
+  actionsRuns: (id: number, gitRef: string | null) => invoke<WorkflowRun[]>("actions_runs", { id, gitRef }),
+  actionsJobs: (id: number, runId: number) => invoke<Job[]>("actions_jobs", { id, runId }),
+  actionsControl: (a: Base & { actionsRun: number; action: "cancel" | "rerun" }) => invoke<StepOutcome>("actions_control", a),
+  attach: (a: Base & { releaseId: number; actionsRun: number }) => invoke<StepOutcome>("attach", a),
+  rollback: (a: Base & { next: string }) => invoke<StepOutcome>("rollback", a),
+  resumeInfo: (runId: number) => invoke<ResumeInfo>("resume_info", { runId }),
+  deviceStart: () => invoke<DeviceCode>("device_start"),
+  devicePoll: (deviceCode: string, interval: number, label: string) =>
+    invoke<{ state: "pending" | "done"; interval: number; account: Account | null }>("device_poll", { deviceCode, interval, label }),
 };
 
 export type Base = { runId: number | null; id: number; dryRun: boolean };
 
 export const errText = (e: unknown) => (typeof e === "string" ? e : (e as Error)?.message ?? String(e));
+
+export { openUrl } from "@tauri-apps/plugin-opener";

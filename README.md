@@ -5,8 +5,8 @@ status, commit, push, version bump, release notes, tag, draft and publish a GitH
 Tauri 2 (Rust) + React + TypeScript. Everything runs locally; the only network calls are
 to the GitHub API and your projects' git remotes.
 
-**Status: Phase 1 (MVP)** from `RELEASE_DESK_SPEC.md`. Phase 2 (PR merge, workflow
-dispatch, run monitor, more adapters, multi-account, resume/rollback) is not built yet.
+**Status: Phases 1 and 2** from `RELEASE_DESK_SPEC.md`. Phase 3 (self-hosted runner panel,
+CHANGELOG.md, `release-desk.json`, AI notes, auto-update) is not built yet.
 
 ## Setup (Windows)
 
@@ -24,7 +24,10 @@ npm run tauri build        # MSI / NSIS installer in src-tauri\target\release\bu
 ## Add a project
 
 1. **Settings** (Ctrl+3): add a GitHub account. Paste a fine-grained token scoped to the
-   repos you release, with *Contents: read/write* (Metadata read is implied). The app checks
+   repos you release, with *Contents*, *Pull requests* and *Actions* read/write (Metadata
+   read is implied). Or use **Sign in with GitHub** (device flow): register a GitHub OAuth
+   App once with "Enable Device Flow", paste its client ID, and approve the code in the
+   browser. You can add several accounts and bind each project to one. The app checks
    it against `GET /user`, stores it in Windows Credential Manager, and keeps only a
    reference in its database. Skip this if you only want local or dry runs.
 2. **Projects → + Add project** (Ctrl+N), then **Browse…** and pick the repo folder.
@@ -56,6 +59,29 @@ npm run tauri build        # MSI / NSIS installer in src-tauri\target\release\bu
 
 Turn dry run off only for a throwaway test repo first (spec §9), e.g. one with the
 `release.yml` from spec §10.
+
+## Phase 2 features
+
+Set these per project under **Edit project**:
+
+- **Merge before release**: *Pull request* opens (or reuses) a PR from the current branch
+  into the default branch, polls its check runs every 5 s, and merges with the chosen
+  method, pinned to the commit that was checked. Then it fast-forwards your local default
+  branch. *Local fast-forward* runs `git merge --ff-only` and works for local-only projects.
+- **Release workflow** and **Trigger**: either the tag push starts it, or the app calls
+  `workflow_dispatch` with inputs such as `version={version}` (`{tag}` and `{notes}` also work).
+  The **Actions** step lists runs for the release commit with live job and step status,
+  cancel, re-run failed jobs, and open in browser.
+- **Attach artifacts**: downloads the chosen run's artifacts and uploads each as
+  `<name>.zip` to the draft release. Existing assets are skipped.
+- **Version files**: Cargo (`Cargo.toml` + `Cargo.lock`), Python (`pyproject.toml`
+  `[project]` or `[tool.poetry]`), Tauri (`tauri.conf.json`), Android (`versionName`, and
+  `versionCode` + 1 on every bump), on top of npm, plain file, regex and git tag.
+- **Resume**: History shows **Resume** on failed or unfinished runs. The wizard reopens with
+  the same version, notes, PR and draft release, at the first unfinished step.
+- **Rollback**: before anything is pushed, *Undo bump* / *Roll back* deletes the local tag,
+  drops the `chore(release)` commit with `git reset --soft HEAD~1`, and restores the version
+  files. It refuses once the commit or tag is on the remote, and never force-pushes.
 
 ## Guardrails
 

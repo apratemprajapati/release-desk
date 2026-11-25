@@ -9,7 +9,7 @@ export type Route =
   | { page: "dashboard" }
   | { page: "add" }
   | { page: "edit"; id: number }
-  | { page: "wizard"; id: number }
+  | { page: "wizard"; id: number; runId?: number }
   | { page: "history"; id?: number }
   | { page: "settings" };
 
@@ -65,8 +65,8 @@ export default function App() {
         {route.page === "dashboard" && <Dashboard go={setRoute} />}
         {route.page === "add" && <AddProject go={setRoute} />}
         {route.page === "edit" && <AddProject go={setRoute} editId={route.id} />}
-        {route.page === "wizard" && <Wizard key={route.id} id={route.id} go={setRoute} />}
-        {route.page === "history" && <History projectId={route.id} />}
+        {route.page === "wizard" && <Wizard key={`${route.id}-${route.runId ?? ""}`} id={route.id} resumeRunId={route.runId} go={setRoute} />}
+        {route.page === "history" && <History projectId={route.id} go={setRoute} />}
         {route.page === "settings" && <Settings />}
       </main>
     </div>

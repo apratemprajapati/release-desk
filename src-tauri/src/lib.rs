@@ -18,6 +18,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let dir = app.path().app_data_dir().expect("no app data dir");
             let store = store::Store::open(&dir.join("release-desk.sqlite3"))?;
@@ -53,6 +54,20 @@ pub fn run() {
             commands::remove_account,
             commands::get_settings,
             commands::set_setting,
+            commands::open_pr,
+            commands::pr_status,
+            commands::merge_pr,
+            commands::merge_ff,
+            commands::list_workflows,
+            commands::dispatch,
+            commands::actions_runs,
+            commands::actions_jobs,
+            commands::actions_control,
+            commands::attach,
+            commands::rollback,
+            commands::resume_info,
+            commands::device_start,
+            commands::device_poll,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Release Desk");

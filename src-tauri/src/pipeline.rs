@@ -481,6 +481,14 @@ impl Desk {
         let r = async {
             guard_remote(p, "merge")?;
             let repo = Desk::repo(p);
+            if dry && n == 0 {
+                // Dry run never created the PR, so there is nothing to look up.
+                ctx.side_effect(&format!("PUT /repos/{}/{}/pulls/<new>/merge ({})", p.owner, p.repo, p.options.merge_method));
+                git::fetch(&ctx, &repo)?;
+                git::checkout(&ctx, &repo, &p.default_branch)?;
+                git::merge_ff_only(&ctx, &repo, &format!("origin/{}", p.default_branch))?;
+                return Ok(json!({ "pr": null, "dry_run": true }));
+            }
             let (_, gh) = self.gh(p)?;
             let pr = gh.get_pr(&ctx, &p.owner, &p.repo, n).await?;
             if pr.merged {

@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
 import { api, Project, Run } from "../lib/api";
-import { Badge, Card, inputCls, Log } from "../components/ui";
+import { Badge, Button, Card, inputCls, Log } from "../components/ui";
+import type { Route } from "../App";
 
 const tone = (s: string) =>
   s === "done" || s === "ok" ? "ok" : s === "failed" ? "bad" : s === "dry-run" ? "warn" : s === "running" ? "accent" : "mute";
 
-export default function History({ projectId }: { projectId?: number }) {
+export default function History({ projectId, go }: { projectId?: number; go: (r: Route) => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [pid, setPid] = useState<number | null>(projectId ?? null);
   const [runs, setRuns] = useState<Run[]>([]);
@@ -36,6 +37,13 @@ export default function History({ projectId }: { projectId?: number }) {
               <Badge tone={tone(r.status)}>{r.status}</Badge>
               <span className="ml-auto text-xs text-mute">{new Date(r.started_at).toLocaleString()}</span>
             </button>
+            {(r.status === "failed" || r.status === "running") && (
+              <div className="-mt-1 px-4 pb-3">
+                <Button variant="primary" onClick={() => go({ page: "wizard", id: r.project_id, runId: r.id })}>
+                  Resume run #{r.id}
+                </Button>
+              </div>
+            )}
             {open === r.id && (
               <div className="border-t border-line">
                 {r.steps.map((s) => (
