@@ -1,6 +1,6 @@
 [package]
 name = "release-desk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Multi-project release GUI: commit, push, bump, notes, tag, GitHub release"
 edition = "2021"
 license = "MIT"
