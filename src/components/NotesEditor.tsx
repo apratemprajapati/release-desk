@@ -3,7 +3,9 @@ import { useMemo } from "react";
 import { Button, inputCls } from "./ui";
 
 /** Split markdown editor and preview. */
-export function NotesEditor(props: { value: string; onChange: (v: string) => void; onRegenerate: () => void }) {
+export function NotesEditor(props: {
+  value: string; onChange: (v: string) => void; onRegenerate: () => void; onPolish?: () => void; polishing?: boolean;
+}) {
   // Raw HTML in notes is escaped: commit messages are untrusted input.
   const html = useMemo(() => {
     const escaped = props.value.replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -13,7 +15,8 @@ export function NotesEditor(props: { value: string; onChange: (v: string) => voi
   }, [props.value]);
   return (
     <div className="flex h-full flex-col gap-2">
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-2">
+        {props.onPolish && <Button disabled={props.polishing} onClick={props.onPolish}>{props.polishing ? "Polishing…" : "Polish with AI…"}</Button>}
         <Button onClick={props.onRegenerate}>Regenerate from commits</Button>
       </div>
       <div className="grid min-h-0 flex-1 grid-cols-2 gap-3">

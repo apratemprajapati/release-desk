@@ -73,6 +73,16 @@ mod tests {
     }
 
     #[test]
+    fn this_repos_release_desk_json_is_valid() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let c = load(root).unwrap().expect("release-desk.json at repo root");
+        let mut p = proj();
+        apply(&mut p, &c).unwrap();
+        assert_eq!(p.adapters.len(), 3);
+        assert_eq!(p.options.workflow.as_deref(), Some("release.yml"));
+    }
+
+    #[test]
     fn applies_and_validates() {
         let c: RepoConfig = serde_json::from_str(r#"{
             "$schema": "./release-desk.schema.json", "tag_format": "app-v{version}",

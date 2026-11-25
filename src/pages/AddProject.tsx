@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { open, ask } from "@tauri-apps/plugin-dialog";
-import { Account, Adapter, api, defaultOptions, errText, Project, ProjectOptions } from "../lib/api";
+import { Account, Adapter, ALL_STEPS, api, defaultOptions, errText, Project, ProjectOptions, TEMPLATES } from "../lib/api";
 import { Badge, Button, Card, Field, inputCls } from "../components/ui";
 import type { Route } from "../App";
 
@@ -22,6 +22,7 @@ export default function AddProject({ go, editId }: { go: (r: Route) => void; edi
   const [err, setErr] = useState("");
   const [workflows, setWorkflows] = useState<string[]>([]);
   const [inputsText, setInputsText] = useState("version={version}");
+  const [repoConfig, setRepoConfig] = useState<string[]>([]);
   const set = (patch: Partial<Project>) => setP((x) => ({ ...x, ...patch }));
   const setOpt = (patch: Partial<ProjectOptions>) => setP((x) => ({ ...x, options: { ...x.options, ...patch } }));
   const parseInputs = (t: string) =>
@@ -36,6 +37,7 @@ export default function AddProject({ go, editId }: { go: (r: Route) => void; edi
         setP({ ...found, options });
         setInputsText(Object.entries(options.dispatch_inputs).map(([k, v]) => `${k}=${v}`).join("\n"));
         api.detectProject(found.path).then((d) => setWorkflows(d.workflows)).catch(() => {});
+        api.effectiveProject(found.id).then((e) => setRepoConfig(e.repo_config)).catch(() => {});
       });
     else api.settings().then((s) => set({ tag_format: s.default_tag_format }));
   }, [editId]);
@@ -157,7 +159,35 @@ export default function AddProject({ go, editId }: { go: (r: Route) => void; edi
               </div>
             </div>
 
+            {repoConfig.length > 0 && (
+              <p className="text-xs text-accent">
+                This repo's release-desk.json overrides: {repoConfig.join(", ")}. Values below are the app's own settings.
+              </p>
+            )}
             <div className="grid grid-cols-2 gap-4 border-t border-line pt-4">
+              <Field label="Template" hint="Fills the steps and options below; you can still change them">
+                <select className={inputCls} value="" onChange={(e) => {
+                  const t = TEMPLATES.find((x) => x.id === e.target.value);
+                  if (t) { set({ pipeline: t.pipeline }); setOpt(t.options); }
+                }}>
+                  <option value="">Apply a template…</option>
+                  {TEMPLATES.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
+                </select>
+              </Field>
+              <Field label="Steps">
+                <div className="flex flex-wrap gap-x-3 gap-y-1 py-1 text-xs">
+                  {ALL_STEPS.map((k) => (
+                    <label key={k} className="flex items-center gap-1">
+                      <input type="checkbox" checked={!p.pipeline.length || p.pipeline.includes(k)}
+                        onChange={(e) => {
+                          const cur = p.pipeline.length ? p.pipeline : [...ALL_STEPS];
+                          set({ pipeline: e.target.checked ? ALL_STEPS.filter((x) => cur.includes(x) || x === k) : cur.filter((x) => x !== k) });
+                        }} />
+                      {k}
+                    </label>
+                  ))}
+                </div>
+              </Field>
               <Field label="Merge before release" hint="PR needs a GitHub account; fast-forward is local only">
                 <select className={inputCls} value={p.options.merge_mode} onChange={(e) => setOpt({ merge_mode: e.target.value as any })}>
                   <option value="none">None: release from the current branch</option>
@@ -188,10 +218,30 @@ export default function AddProject({ go, editId }: { go: (r: Route) => void; edi
                 </Field>
               )}
               <Field label="Release assets">
-                <label className="flex items-center gap-2 py-1.5">
-                  <input type="checkbox" checked={p.options.attach_artifacts} onChange={(e) => setOpt({ attach_artifacts: e.target.checked })} />
-                  <span>Attach the workflow run's artifacts as .zip files</span>
+                <select className={inputCls} value={p.options.attach_artifacts ? p.options.attach_mode : "off"}
+                  onChange={(e) => e.target.value === "off" ? setOpt({ attach_artifacts: false }) : setOpt({ attach_artifacts: true, attach_mode: e.target.value as any })}>
+                  <option value="files">Attach the files inside each artifact</option>
+                  <option value="zip">Attach each artifact as a .zip</option>
+                  <option value="off">Do not attach artifacts</option>
+                </select>
+              </Field>
+              <Field label="Changelog">
+                <label className="flex items-center gap-2 py-1">
+                  <input type="checkbox" checked={p.options.changelog} onChange={(e) => setOpt({ changelog: e.target.checked })} />
+                  <span>Add the notes to</span>
+                  <input className="w-40" value={p.options.changelog_file} disabled={!p.options.changelog}
+                    onChange={(e) => setOpt({ changelog_file: e.target.value })} />
                 </label>
+              </Field>
+              <Field label="Self-hosted runner folder" hint="Optional: an actions-runner folder on this PC, managed from the Runners page">
+                <div className="flex gap-2">
+                  <input className={inputCls} value={p.options.runner_dir ?? ""} placeholder="C:\actions-runner"
+                    onChange={(e) => setOpt({ runner_dir: e.target.value || null })} />
+                  <Button onClick={async () => {
+                    const d = await open({ directory: true, title: "Choose the actions-runner folder" });
+                    if (d && !Array.isArray(d)) setOpt({ runner_dir: d });
+                  }}>Browse…</Button>
+                </div>
               </Field>
             </div>
           </>

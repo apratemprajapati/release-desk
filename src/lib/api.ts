@@ -17,12 +17,31 @@ export interface ProjectOptions {
   dispatch: boolean;
   dispatch_inputs: Record<string, string>;
   attach_artifacts: boolean;
+  attach_mode: "files" | "zip";
+  changelog: boolean;
+  changelog_file: string;
+  runner_dir: string | null;
 }
 
 export const defaultOptions = (): ProjectOptions => ({
   merge_mode: "none", merge_method: "squash", workflow: null, dispatch: false,
-  dispatch_inputs: { version: "{version}" }, attach_artifacts: true,
+  dispatch_inputs: { version: "{version}" }, attach_artifacts: true, attach_mode: "files",
+  changelog: false, changelog_file: "CHANGELOG.md", runner_dir: null,
 });
+
+export const ALL_STEPS = ["status", "commit", "push", "merge", "version", "notes", "tag", "actions", "release", "publish"] as const;
+
+/** Built-in pipeline templates (Edit project → Template). */
+export const TEMPLATES: { id: string; label: string; pipeline: string[]; options: Partial<ProjectOptions> }[] = [
+  { id: "full", label: "Full: PR, merge, tag, Actions, release", pipeline: [...ALL_STEPS],
+    options: { merge_mode: "pr", dispatch: false, attach_artifacts: true, changelog: true } },
+  { id: "library", label: "Library: tag and GitHub release, no build", pipeline: ["status", "commit", "push", "version", "notes", "tag", "release", "publish"],
+    options: { merge_mode: "none", workflow: null, attach_artifacts: false, changelog: true } },
+  { id: "app", label: "App: dispatch a build and attach installers", pipeline: [...ALL_STEPS],
+    options: { merge_mode: "none", dispatch: true, attach_artifacts: true, attach_mode: "files" } },
+  { id: "local", label: "Local only: commit, bump, tag", pipeline: ["status", "commit", "merge", "version", "notes", "tag"],
+    options: { merge_mode: "ff", attach_artifacts: false } },
+];
 
 export interface Project {
   id: number;
@@ -93,7 +112,12 @@ export interface Run {
   id: number; project_id: number; from_version: string; to_version: string; status: string;
   dry_run: boolean; started_at: string; finished_at: string | null; steps: Step[];
 }
-export interface Settings { git_path: string; default_tag_format: string; oauth_client_id: string }
+export interface Settings {
+  git_path: string; default_tag_format: string; oauth_client_id: string; ai_model: string; ai_key_set: boolean;
+}
+export interface Effective { project: Project; repo_config: string[]; repo_config_error: string | null }
+export interface LocalRunner { dir: string; exists: boolean; configured: boolean; running: boolean; pid: number | null; log_file: string }
+export interface GhRunner { id: number; name: string; os: string; status: string; busy: boolean; labels: { name: string }[] }
 
 export interface CheckRun { name: string; status: string; conclusion: string | null; html_url: string | null }
 export interface Pr {
@@ -152,6 +176,14 @@ export const api = {
   actionsControl: (a: Base & { actionsRun: number; action: "cancel" | "rerun" }) => invoke<StepOutcome>("actions_control", a),
   attach: (a: Base & { releaseId: number; actionsRun: number }) => invoke<StepOutcome>("attach", a),
   rollback: (a: Base & { next: string }) => invoke<StepOutcome>("rollback", a),
+  effectiveProject: (id: number) => invoke<Effective>("effective_project", { id }),
+  runnerStatus: (id: number) => invoke<LocalRunner>("runner_status", { id }),
+  runnerStart: (id: number) => invoke<LocalRunner>("runner_start", { id }),
+  runnerStop: (id: number) => invoke<LocalRunner>("runner_stop", { id }),
+  runnerLog: (id: number) => invoke<string>("runner_log", { id }),
+  githubRunners: (id: number) => invoke<GhRunner[]>("github_runners", { id }),
+  setAiKey: (key: string) => invoke<void>("set_ai_key", { key }),
+  polishNotes: (notes: string) => invoke<string>("polish_notes", { notes }),
   resumeInfo: (runId: number) => invoke<ResumeInfo>("resume_info", { runId }),
   deviceStart: () => invoke<DeviceCode>("device_start"),
   devicePoll: (deviceCode: string, interval: number, label: string) =>

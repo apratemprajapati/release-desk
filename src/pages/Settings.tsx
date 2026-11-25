@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { Account, api, DeviceCode, errText, openUrl } from "../lib/api";
 import { Button, Card, Field, inputCls } from "../components/ui";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { getVersion } from "@tauri-apps/api/app";
 
 export default function Settings() {
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -14,10 +17,16 @@ export default function Settings() {
   const [busy, setBusy] = useState(false);
   const [clientId, setClientId] = useState("");
   const [device, setDevice] = useState<DeviceCode | null>(null);
+  const [aiKey, setAiKey] = useState("");
+  const [aiModel, setAiModel] = useState("");
+  const [aiSet, setAiSet] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
+  const [update, setUpdate] = useState("");
 
   const load = () => {
     api.accounts().then(setAccounts);
-    api.settings().then((s) => { setGitPath(s.git_path); setTagFmt(s.default_tag_format); setClientId(s.oauth_client_id); });
+    api.settings().then((s) => { setGitPath(s.git_path); setTagFmt(s.default_tag_format); setClientId(s.oauth_client_id); setAiModel(s.ai_model); setAiSet(s.ai_key_set); });
+    getVersion().then(setAppVersion).catch(() => {});
   };
   useEffect(load, []);
 
@@ -54,6 +63,31 @@ export default function Settings() {
       setErr(errText(e));
     }
     setDevice(null);
+  }
+
+  async function saveAi(clear = false) {
+    setErr("");
+    try {
+      await api.setAiKey(clear ? "" : aiKey);
+      await api.setSetting("ai_model", aiModel.trim());
+      setAiKey("");
+      setMsg(clear ? "AI key removed." : "AI settings saved. The key is in the OS keychain.");
+      load();
+    } catch (e) { setErr(errText(e)); }
+  }
+
+  async function checkUpdate() {
+    setUpdate("Checking…");
+    try {
+      const u = await check();
+      if (!u) return setUpdate("You have the latest version.");
+      setUpdate(`Downloading ${u.version}…`);
+      await u.downloadAndInstall();
+      setUpdate(`Installed ${u.version}. Restarting…`);
+      await relaunch();
+    } catch (e) {
+      setUpdate(`Update check failed: ${errText(e)}`);
+    }
   }
 
   async function save() {
@@ -112,6 +146,30 @@ export default function Settings() {
               <span className="text-xs text-mute">Waiting for approval… (the label above is used for the account)</span>
             </div>
           )}
+        </div>
+      </Card>
+
+      <Card className="p-5">
+        <h2 className="mb-1 font-semibold">AI notes polishing (optional)</h2>
+        <p className="mb-4 text-xs text-mute">
+          Off unless you add your own Anthropic API key. Only the release notes text is sent, and only when you press
+          "Polish with AI" and confirm. {aiSet ? "A key is stored in the OS keychain." : "No key stored."}
+        </p>
+        <div className="grid grid-cols-[1fr_200px_auto_auto] items-end gap-2">
+          <Field label="API key"><input className={`${inputCls} font-mono`} type="password" autoComplete="off" value={aiKey}
+            onChange={(e) => setAiKey(e.target.value)} placeholder={aiSet ? "stored; type to replace" : "sk-ant-…"} /></Field>
+          <Field label="Model"><input className={`${inputCls} font-mono`} value={aiModel} onChange={(e) => setAiModel(e.target.value)} /></Field>
+          <Button variant="primary" disabled={!aiKey.trim() && !aiSet} onClick={() => saveAi()}>Save</Button>
+          <Button variant="danger" disabled={!aiSet} onClick={() => saveAi(true)}>Remove key</Button>
+        </div>
+      </Card>
+
+      <Card className="p-5">
+        <h2 className="mb-1 font-semibold">Updates</h2>
+        <p className="mb-3 text-xs text-mute">Release Desk {appVersion}. Updates come from the signed releases of apratemprajapati/release-desk.</p>
+        <div className="flex items-center gap-3">
+          <Button onClick={checkUpdate}>Check for updates</Button>
+          {update && <span className="text-xs text-mute">{update}</span>}
         </div>
       </Card>
 
