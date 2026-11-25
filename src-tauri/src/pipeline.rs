@@ -427,10 +427,12 @@ fn unzip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     let mut out = vec![];
     for i in 0..z.len() {
         let mut f = z.by_index(i).map_err(|e| Error::Other(e.to_string()))?;
-        if f.is_dir() {
+        // Directories and symlinks are skipped: only regular files become assets.
+        if f.is_dir() || f.is_symlink() {
             continue;
         }
-        let name = f.name().rsplit('/').next().unwrap_or("").to_string();
+        let full = f.name().map_err(|e| Error::Other(format!("artifact zip: {e}")))?.to_string();
+        let name = full.rsplit(['/', '\\']).next().unwrap_or("").to_string();
         if name.is_empty() {
             continue;
         }
