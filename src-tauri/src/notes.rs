@@ -106,6 +106,32 @@ pub fn render(commits: &[Commit], n: &NotesInput) -> String {
     out.trim_end().to_string() + "\n"
 }
 
+/// Insert a release section into a Keep-a-Changelog style file, newest first.
+/// Returns None when that version already has a section (idempotent).
+pub fn changelog_insert(existing: &str, version: &str, date: &str, notes_md: &str) -> Option<String> {
+    let heading = format!("## [{version}]");
+    if existing.lines().any(|l| l.starts_with(&heading)) {
+        return None;
+    }
+    // Keep-a-Changelog: `### Group` sections sit under the `## [version]` heading.
+    let body: String = notes_md
+        .lines()
+        .map(|l| if l.starts_with("## ") { format!("#{l}") } else { l.to_string() })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let section = format!("{heading} - {date}\n\n{}\n\n", body.trim());
+    if existing.trim().is_empty() {
+        return Some(format!(
+            "# Changelog\n\nAll notable changes to this project are documented here.\n\n{}",
+            section.trim_end().to_string() + "\n"
+        ));
+    }
+    let pos = existing.find("\n## ").map(|i| i + 1).unwrap_or(existing.len());
+    let (head, tail) = existing.split_at(pos);
+    let head = if head.ends_with("\n\n") || head.is_empty() { head.to_string() } else { format!("{}\n", head.trim_end_matches('\n').to_string() + "\n") };
+    Some(format!("{head}{section}{tail}").trim_end().to_string() + "\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +171,20 @@ mod tests {
         assert!(md.contains("- **core:** two ([#7](https://github.com/o/r/pull/7))"));
         assert!(md.contains("Ann, Bob, Cy"));
         assert!(md.contains("compare/v0.9.0...v1.0.0"));
+    }
+
+    #[test]
+    fn changelog_prepends_newest_first() {
+        let notes = "### Features\n\n- one\n";
+        let first = changelog_insert("", "1.0.0", "2026-11-25", notes).unwrap();
+        assert!(first.starts_with("# Changelog\n"));
+        assert!(first.contains("## [1.0.0] - 2026-11-25\n\n### Features\n\n- one\n"));
+        let second = changelog_insert(&first, "1.1.0", "2026-12-01", "### Fixes\n\n- two").unwrap();
+        assert!(second.find("## [1.1.0]").unwrap() < second.find("## [1.0.0]").unwrap());
+        assert!(second.contains("All notable changes"));
+        assert!(changelog_insert(&second, "1.1.0", "x", "y").is_none(), "idempotent");
+        let custom = changelog_insert("# History\n\nSome text.\n", "0.2.0", "d", "- a").unwrap();
+        assert!(custom.starts_with("# History\n\nSome text.\n\n## [0.2.0] - d\n\n- a\n"), "{custom}");
     }
 
     #[test]

@@ -1,3 +1,5 @@
+pub mod ai;
+pub mod config;
 pub mod error;
 pub mod exec;
 pub mod git;
@@ -5,6 +7,7 @@ pub mod github;
 pub mod notes;
 pub mod pipeline;
 pub mod redact;
+pub mod runner;
 pub mod store;
 pub mod version;
 
@@ -26,6 +29,8 @@ pub fn run() {
                 store,
                 secrets: Arc::new(store::KeyringSecrets),
                 api_base: None,
+                ai_base: None,
+                runners: Default::default(),
             });
             Ok(())
         })

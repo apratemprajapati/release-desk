@@ -9,7 +9,7 @@ use std::process::Command;
 /// Commands that are allowed to run during dry-run. Everything else is a write.
 const READ_ONLY: &[&str] = &[
     "status", "diff", "log", "rev-parse", "remote", "describe", "tag", "rev-list",
-    "symbolic-ref", "show", "ls-remote", "for-each-ref", "config",
+    "symbolic-ref", "show", "ls-remote", "for-each-ref", "config", "ls-files", "cat-file",
 ];
 
 fn is_read(args: &[&str]) -> bool {
@@ -233,6 +233,10 @@ pub fn annotated_tag(ctx: &Ctx, repo: &Path, tag: &str, message: &str) -> Result
 pub fn push(ctx: &Ctx, repo: &Path, refspec: &str) -> Result<()> {
     write(ctx, repo, &["push", "origin", refspec])?;
     Ok(())
+}
+
+pub fn is_tracked(ctx: &Ctx, repo: &Path, path: &str) -> bool {
+    read(ctx, repo, &["ls-files", "--error-unmatch", "--", path]).is_ok()
 }
 
 pub fn subject(ctx: &Ctx, repo: &Path, rev: &str) -> Result<String> {

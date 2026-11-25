@@ -39,8 +39,15 @@ pub struct ProjectOptions {
     pub dispatch: bool,
     /// Dispatch inputs; values may use {version}, {tag} and {notes}.
     pub dispatch_inputs: std::collections::BTreeMap<String, String>,
-    /// Upload the run's artifacts to the release as zip assets.
+    /// Upload the run's artifacts to the release.
     pub attach_artifacts: bool,
+    /// "files": upload each file inside the artifact; "zip": upload `<name>.zip`.
+    pub attach_mode: String,
+    /// Prepend the notes to a changelog file in the release commit.
+    pub changelog: bool,
+    pub changelog_file: String,
+    /// Local self-hosted runner folder (contains run.cmd / run.sh).
+    pub runner_dir: Option<String>,
 }
 
 impl Default for ProjectOptions {
@@ -52,6 +59,10 @@ impl Default for ProjectOptions {
             dispatch: false,
             dispatch_inputs: [("version".to_string(), "{version}".to_string())].into(),
             attach_artifacts: true,
+            attach_mode: "files".into(),
+            changelog: false,
+            changelog_file: "CHANGELOG.md".into(),
+            runner_dir: None,
         }
     }
 }
@@ -87,6 +98,9 @@ pub struct Step {
     pub started_at: String,
     pub finished_at: Option<String>,
 }
+
+/// Phase 1 default, upgraded on load so old projects show the new steps.
+const PHASE1_PIPELINE: &[&str] = &["status", "commit", "push", "version", "notes", "tag", "release"];
 
 pub const DEFAULT_PIPELINE: &[&str] =
     &["status", "commit", "push", "merge", "version", "notes", "tag", "actions", "release", "publish"];
@@ -223,7 +237,14 @@ impl Store {
                 id: r.get(0)?, name: r.get(1)?, path: r.get(2)?, owner: r.get(3)?, repo: r.get(4)?,
                 account_id: r.get(5)?, default_branch: r.get(6)?, release_branch: r.get(7)?,
                 tag_format: r.get(8)?, local_only: r.get(9)?,
-                pipeline: serde_json::from_str(&pipeline).unwrap_or_default(),
+                pipeline: {
+                    let v: Vec<String> = serde_json::from_str(&pipeline).unwrap_or_default();
+                    if v.is_empty() || v == PHASE1_PIPELINE {
+                        DEFAULT_PIPELINE.iter().map(|s| s.to_string()).collect()
+                    } else {
+                        v
+                    }
+                },
                 adapters: serde_json::from_str(&adapters).unwrap_or_default(),
                 options: serde_json::from_str(&options).unwrap_or_default(),
             })
