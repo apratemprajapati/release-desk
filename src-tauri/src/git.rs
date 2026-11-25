@@ -218,7 +218,8 @@ pub fn commit(ctx: &Ctx, repo: &Path, message: &str) -> Result<()> {
     let mut tmp = tempfile::NamedTempFile::new()?;
     std::io::Write::write_all(&mut tmp, message.as_bytes())?;
     let p = tmp.path().to_string_lossy().to_string();
-    write(ctx, repo, &["commit", "-F", &p])?;
+    // whitespace cleanup keeps lines starting with "#" (markdown headings, "#12 fixed").
+    write(ctx, repo, &["commit", "--cleanup=whitespace", "-F", &p])?;
     Ok(())
 }
 
@@ -226,7 +227,7 @@ pub fn annotated_tag(ctx: &Ctx, repo: &Path, tag: &str, message: &str) -> Result
     let mut tmp = tempfile::NamedTempFile::new()?;
     std::io::Write::write_all(&mut tmp, message.as_bytes())?;
     let p = tmp.path().to_string_lossy().to_string();
-    write(ctx, repo, &["tag", "-a", tag, "-F", &p])?;
+    write(ctx, repo, &["tag", "-a", "--cleanup=whitespace", tag, "-F", &p])?;
     Ok(())
 }
 

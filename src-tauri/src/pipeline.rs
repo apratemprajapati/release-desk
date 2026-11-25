@@ -349,7 +349,14 @@ impl Desk {
             } else {
                 guard_remote(p, "push")?;
                 git::push(&ctx, &repo, &branch)?;
-                git::push(&ctx, &repo, &format!("refs/tags/{tag}"))?;
+                // Idempotent: skip the tag push when origin already has this exact tag.
+                let local = git::read(&ctx, &repo, &["rev-parse", &format!("refs/tags/{tag}")]).unwrap_or_default();
+                let remote = git::read(&ctx, &repo, &["ls-remote", "--tags", "origin", &format!("refs/tags/{tag}")]).unwrap_or_default();
+                if !local.trim().is_empty() && remote.split_whitespace().next() == Some(local.trim()) {
+                    ctx.log(&format!("origin already has {tag}, not pushing it again"));
+                } else {
+                    git::push(&ctx, &repo, &format!("refs/tags/{tag}"))?;
+                }
                 true
             };
             Ok(json!({ "tag": tag, "committed": committed, "pushed": pushed, "branch": branch }))

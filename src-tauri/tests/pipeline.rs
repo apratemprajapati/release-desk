@@ -130,6 +130,8 @@ async fn full_pipeline_offline() {
     assert_eq!(sh(&fx.work, &["log", "-1", "--format=%s"]), "chore(release): v1.1.0");
     assert!(sh(&fx.bare, &["tag", "-l"]).contains("v1.1.0"));
     assert!(sh(&fx.work, &["status", "--porcelain"]).is_empty());
+    let tag_msg = sh(&fx.work, &["tag", "-l", "--format=%(contents)", "v1.1.0"]);
+    assert!(tag_msg.contains("### Features") && tag_msg.contains("### Fixes"), "markdown headings kept in tag: {tag_msg}");
 
     let r = d.step_release(Some(run), &p, false, &plan.next, &plan.notes, false).await;
     assert!(r.ok, "{}", r.log);
@@ -140,6 +142,7 @@ async fn full_pipeline_offline() {
     // Idempotent re-run of tag step: no duplicate commit or tag error.
     let again = d.step_tag(Some(run), &p, false, &plan.next, &plan.notes);
     assert!(again.ok && again.meta["committed"] == false, "{}", again.log);
+    assert!(again.log.contains("origin already has v1.1.0"), "{}", again.log);
 
     let runs = d.store.runs(Some(pid)).unwrap();
     assert_eq!(runs[0].status, "done");
@@ -183,7 +186,7 @@ async fn dry_run_has_zero_side_effects() {
     }
     assert_eq!(before, snapshot(&fx), "dry run changed the repo or remote");
     for planned in ["would git add", "would git commit", "would git push origin main", "would write package.json",
-        "would git tag -a v1.1.0", "would POST /repos/o/r/releases", "would PATCH /repos/o/r/releases/1"] {
+        "would git tag -a --cleanup=whitespace v1.1.0", "would POST /repos/o/r/releases", "would PATCH /repos/o/r/releases/1"] {
         assert!(logs.contains(planned), "missing plan line '{planned}' in:\n{logs}");
     }
     assert!(!logs.contains(TOKEN));
