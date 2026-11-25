@@ -103,6 +103,13 @@ impl Runners {
         Ok(self.status(dir))
     }
 
+    pub fn stop_all(&self) {
+        let dirs: Vec<String> = self.0.lock().unwrap().keys().cloned().collect();
+        for d in dirs {
+            let _ = self.stop(&d);
+        }
+    }
+
     pub fn tail_log(&self, dir: &str, lines: usize) -> String {
         let text = std::fs::read_to_string(log_path(Path::new(dir))).unwrap_or_default();
         let v: Vec<&str> = text.lines().collect();

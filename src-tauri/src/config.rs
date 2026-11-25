@@ -41,14 +41,26 @@ pub fn apply(p: &mut Project, c: &RepoConfig) -> Result<Vec<String>> {
         p.tag_format = v.clone();
         set.push("tag_format".into());
     }
-    if let Some(v) = &c.default_branch { p.default_branch = v.clone(); set.push("default_branch".into()); }
-    if let Some(v) = &c.release_branch { p.release_branch = v.clone(); set.push("release_branch".into()); }
+    if let Some(v) = &c.default_branch { crate::safety::git_ref(v)?; p.default_branch = v.clone(); set.push("default_branch".into()); }
+    if let Some(v) = &c.release_branch { crate::safety::git_ref(v)?; p.release_branch = v.clone(); set.push("release_branch".into()); }
     if c.local_only == Some(true) { p.local_only = true; set.push("local_only".into()); }
-    if let Some(v) = &c.version_files { p.adapters = v.clone(); set.push("version_files".into()); }
+    if let Some(v) = &c.version_files {
+        for a in v {
+            for f in adapter_files(a) {
+                crate::safety::repo_path(Path::new("."), &f).map_err(|e| Error::Other(format!("{FILE}: {e}")))?;
+            }
+        }
+        p.adapters = v.clone();
+        set.push("version_files".into());
+    }
     if let Some(v) = &c.pipeline { p.pipeline = v.clone(); set.push("pipeline".into()); }
     if let Some(o) = &c.options {
         let mut cur = serde_json::to_value(&p.options)?;
         for (k, v) in o {
+            // Machine-specific: a repo must never choose a folder whose script the app runs.
+            if k == "runner_dir" {
+                return Err(Error::Other(format!("{FILE}: runner_dir is a per-PC setting and cannot be set by the repo")));
+            }
             if cur.get(k).is_none() {
                 return Err(Error::Other(format!("{FILE}: unknown option '{k}'")));
             }
@@ -56,8 +68,29 @@ pub fn apply(p: &mut Project, c: &RepoConfig) -> Result<Vec<String>> {
             set.push(format!("options.{k}"));
         }
         p.options = serde_json::from_value(cur).map_err(|e| Error::Other(format!("{FILE}: {e}")))?;
+        crate::safety::repo_path(Path::new("."), &p.options.changelog_file).map_err(|e| Error::Other(format!("{FILE}: {e}")))?;
+        if let Some(w) = p.options.workflow.as_deref().filter(|w| !w.is_empty()) {
+            crate::safety::workflow(w).map_err(|e| Error::Other(format!("{FILE}: {e}")))?;
+        }
+        if !["none", "pr", "ff"].contains(&p.options.merge_mode.as_str())
+            || !["merge", "squash", "rebase"].contains(&p.options.merge_method.as_str())
+            || !["files", "zip"].contains(&p.options.attach_mode.as_str())
+        {
+            return Err(Error::Other(format!("{FILE}: invalid merge_mode, merge_method or attach_mode")));
+        }
     }
     Ok(set)
+}
+
+fn adapter_files(a: &AdapterConfig) -> Vec<String> {
+    match a {
+        AdapterConfig::Npm { file } | AdapterConfig::PlainFile { file } | AdapterConfig::Cargo { file }
+        | AdapterConfig::Python { file } | AdapterConfig::Tauri { file } | AdapterConfig::Android { file } => {
+            file.iter().cloned().collect()
+        }
+        AdapterConfig::Regex { file, .. } => vec![file.clone()],
+        AdapterConfig::GitTag => vec![],
+    }
 }
 
 #[cfg(test)]
@@ -103,5 +136,17 @@ mod tests {
         assert!(serde_json::from_str::<RepoConfig>(r#"{"bogus": 1}"#).is_err());
         assert!(apply(&mut proj(), &serde_json::from_str(r#"{"options": {"nope": 1}}"#).unwrap()).is_err());
         assert!(apply(&mut proj(), &serde_json::from_str(r#"{"tag_format": "v"}"#).unwrap()).is_err());
+        // Hostile repo files are refused.
+        for bad in [
+            r#"{"version_files": [{"kind": "plain-file", "file": "../../outside.txt"}]}"#,
+            r#"{"version_files": [{"kind": "regex", "file": "C:/Windows/x.ini", "pattern": "(.*)"}]}"#,
+            r#"{"options": {"changelog_file": "/etc/motd"}}"#,
+            r#"{"options": {"runner_dir": "C:/Users/x/evil"}}"#,
+            r#"{"options": {"workflow": "../../pulls"}}"#,
+            r#"{"default_branch": "--upload-pack=evil"}"#,
+            r#"{"options": {"merge_mode": "yolo"}}"#,
+        ] {
+            assert!(apply(&mut proj(), &serde_json::from_str(bad).unwrap()).is_err(), "{bad}");
+        }
     }
 }

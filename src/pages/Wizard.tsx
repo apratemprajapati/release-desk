@@ -167,6 +167,7 @@ export default function Wizard({ id, resumeRunId, go }: { id: number; resumeRunI
     setState(initialStates(project));
     setReleaseId(null); setReleaseUrl(""); setFrozen(null); setPrNumber(null); setPrStatus(null);
     setActionsRun(null); setActionsRunId(null);
+    setBump({ kind: "auto" }); setNotes(""); setAllowFailing(false); setPrerelease(false);
     setActive("changes");
     setLog("");
     setRefresh((n) => n + 1);
@@ -209,6 +210,11 @@ export default function Wizard({ id, resumeRunId, go }: { id: number; resumeRunI
     ? project.pipeline.includes("status") || project.pipeline.includes("commit")
     : project.pipeline.includes(k));
   const visible = STEPS.filter((s) => enabled(s.key));
+  const nextVisible = (k: Key): Key => {
+    const i = visible.findIndex((s) => s.key === k);
+    return (visible[i + 1] ?? visible[i]).key;
+  };
+  const published = state.publish === "ok" || state.publish === "dry";
   const needPlan = (k: Key) => ["tag", "actions", "release", "publish"].includes(k) && !plan;
 
   return (
@@ -252,11 +258,18 @@ export default function Wizard({ id, resumeRunId, go }: { id: number; resumeRunI
         </ol>
 
         <section className="min-w-0 flex-1 overflow-auto p-5">
+          {published && (
+            <div className="mb-4 flex items-center gap-3 rounded-md border border-ok/40 bg-ok/10 px-4 py-3 text-[13px]">
+              <span className="text-ok">{dry ? "Dry run finished: nothing was changed." : `Released ${plan?.tag ?? ""}.`}</span>
+              {!dry && releaseUrl && <Button onClick={() => openUrl(releaseUrl)}>Open release</Button>}
+              <Button className="ml-auto" onClick={() => go({ page: "history", id })}>View history</Button>
+            </div>
+          )}
           {active === "changes" && (
             <div className="h-full min-h-[420px]">
               <Changes projectId={id} busy={busy} refreshKey={refresh}
-                onCommit={(files, message) => exec("changes", (b) => api.commit({ ...b, files, message }), "push")} />
-              <div className="mt-2 flex justify-end"><Button onClick={() => skip("changes", "push")}>Skip</Button></div>
+                onSkip={() => skip("changes", nextVisible("changes"))}
+                onCommit={(files, message, allowSecrets) => exec("changes", (b) => api.commit({ ...b, files, message, allowSecrets }), nextVisible("changes"))} />
             </div>
           )}
 

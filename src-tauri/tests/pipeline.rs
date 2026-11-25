@@ -130,6 +130,8 @@ async fn full_pipeline_offline() {
     assert_eq!(sh(&fx.work, &["log", "-1", "--format=%s"]), "chore(release): v1.1.0");
     assert!(sh(&fx.bare, &["tag", "-l"]).contains("v1.1.0"));
     assert!(sh(&fx.work, &["status", "--porcelain"]).is_empty());
+    let tag_msg = sh(&fx.work, &["tag", "-l", "--format=%(contents)", "v1.1.0"]);
+    assert!(tag_msg.contains("### Features") && tag_msg.contains("### Fixes"), "markdown headings kept in tag: {tag_msg}");
 
     let r = d.step_release(Some(run), &p, false, &plan.next, &plan.notes, false).await;
     assert!(r.ok, "{}", r.log);
@@ -140,6 +142,7 @@ async fn full_pipeline_offline() {
     // Idempotent re-run of tag step: no duplicate commit or tag error.
     let again = d.step_tag(Some(run), &p, false, &plan.next, &plan.notes);
     assert!(again.ok && again.meta["committed"] == false, "{}", again.log);
+    assert!(again.log.contains("origin already has v1.1.0"), "{}", again.log);
 
     let runs = d.store.runs(Some(pid)).unwrap();
     assert_eq!(runs[0].status, "done");
@@ -183,7 +186,7 @@ async fn dry_run_has_zero_side_effects() {
     }
     assert_eq!(before, snapshot(&fx), "dry run changed the repo or remote");
     for planned in ["would git add", "would git commit", "would git push origin main", "would write package.json",
-        "would git tag -a v1.1.0", "would POST /repos/o/r/releases", "would PATCH /repos/o/r/releases/1"] {
+        "would git tag -a --cleanup=whitespace v1.1.0", "would POST /repos/o/r/releases", "would PATCH /repos/o/r/releases/1"] {
         assert!(logs.contains(planned), "missing plan line '{planned}' in:\n{logs}");
     }
     assert!(!logs.contains(TOKEN));
@@ -515,4 +518,70 @@ fn changelog_in_release_commit_and_repo_config() {
     assert!(r.ok, "{}", r.log);
     assert_eq!(sh(&fx.work, &["log", "-1", "--format=%s"]), "chore: add release-desk.json");
     assert!(sh(&fx.work, &["status", "--porcelain"]).contains("?? CHANGELOG.md"));
+}
+
+// ================================================================ audit fixes
+
+#[test]
+fn secret_files_are_refused_and_hidden() {
+    let fx = fixture();
+    let keydir = fx.work.join("%USERPROFILE%/.tauri");
+    std::fs::create_dir_all(&keydir).unwrap();
+    std::fs::write(keydir.join("release-desk.key"), "dW50cnVzdGVkIGNvbW1lbnQ6IHJzaWduIGVuY3J5cHRlZCBzZWNyZXQga2V5").unwrap();
+    let d = desk(None);
+    let pid = d.store.add_project(&project(&fx, true)).unwrap();
+    let p = d.store.project(pid).unwrap();
+    let key = "%USERPROFILE%/.tauri/release-desk.key".to_string();
+    let head = sh(&fx.work, &["rev-parse", "HEAD"]);
+
+    let o = d.step_commit_checked(None, &p, false, &[key.clone(), "b.txt".into()], "chore: x", false);
+    assert!(!o.ok && o.log.contains("look like secrets"), "{}", o.log);
+    assert_eq!(sh(&fx.work, &["rev-parse", "HEAD"]), head, "nothing committed");
+    assert!(sh(&fx.work, &["diff", "--cached", "--name-only"]).is_empty(), "nothing staged");
+
+    let preview = release_desk::git::diff_file(&Ctx::new(false), &fx.work, &key, true).unwrap();
+    assert!(preview.contains("contents hidden") && !preview.contains("dW50cnVz"), "{preview}");
+
+    // Explicit override still works (the UI asks first).
+    let ok = d.step_commit_checked(None, &p, false, &[key], "chore: commit on purpose", true);
+    assert!(ok.ok, "{}", ok.log);
+}
+
+#[test]
+fn hostile_paths_and_refs_are_refused() {
+    let fx = fixture();
+    let d = desk(None);
+    let pid = d.store.add_project(&project(&fx, true)).unwrap();
+    let mut p = d.store.project(pid).unwrap();
+    let ctx = Ctx::new(false);
+    // Path traversal in a staged file and in a version file.
+    assert!(!d.step_commit(None, &p, false, &["../outside.txt".into()], "fix: x").ok);
+    p.adapters = vec![AdapterConfig::PlainFile { file: Some("../../evil".into()) }];
+    assert!(!d.step_version(None, &p, false, "9.9.9").ok);
+    assert!(!fx.work.parent().unwrap().parent().unwrap().join("evil").exists());
+    // Option injection through a branch name.
+    assert!(release_desk::git::checkout(&ctx, &fx.work, "--orphan=x").is_err());
+    assert!(release_desk::git::push(&ctx, &fx.work, "+main").is_err());
+    // Force is an error, not a panic.
+    assert!(release_desk::git::write(&ctx, &fx.work, &["push", "--force", "origin", "main"]).is_err());
+    // A repo slug that would change the API URL.
+    let mut r = project(&fx, false);
+    r.owner = "o/../../user".into();
+    assert!(release_desk::pipeline::guard_remote(&r, "x").is_err());
+}
+
+#[test]
+fn notes_for_an_existing_tag_cover_previous_tag_to_it() {
+    let fx = fixture();
+    sh(&fx.work, &["add", "."]);
+    sh(&fx.work, &["commit", "-q", "-m", "fix: b"]);
+    sh(&fx.work, &["tag", "-a", "v1.1.0", "-m", "v1.1.0"]);
+    let d = desk(None);
+    let pid = d.store.add_project(&project(&fx, true)).unwrap();
+    let p = d.store.project(pid).unwrap();
+    let plan = pipeline::plan(&Ctx::new(false), &p, &Bump::Custom { version: "1.1.0".into() }).unwrap();
+    assert!(plan.tag_exists);
+    assert_eq!(plan.prev_tag.as_deref(), Some("v1.0.0"));
+    assert_eq!(plan.commits.len(), 2, "feat(core) and fix since v1.0.0");
+    assert!(plan.notes.contains("### Features") && plan.notes.contains("### Fixes"));
 }

@@ -50,10 +50,9 @@ pub fn read(ctx: &Ctx, repo: &Path, args: &[&str]) -> Result<String> {
 
 /// Run a mutating git command (skipped and logged in dry-run).
 pub fn write(ctx: &Ctx, repo: &Path, args: &[&str]) -> Result<String> {
-    assert!(
-        !args.iter().any(|a| *a == "--force" || *a == "-f" || a.starts_with("--force")),
-        "force operations are never allowed"
-    );
+    if args.iter().any(|a| *a == "--force" || *a == "-f" || a.starts_with("--force") || a.starts_with("+")) {
+        return Err(Error::Blocked("force operations are never allowed".into()));
+    }
     if ctx.side_effect(&format!("git {}", args.join(" "))) {
         let o = raw(ctx, repo, args)?;
         if !o.trim().is_empty() {
@@ -120,9 +119,27 @@ pub fn status(ctx: &Ctx, repo: &Path) -> Result<Status> {
     Ok(parse_status(&read(ctx, repo, &["status", "--porcelain=v2", "-b", "--untracked-files=all"])?))
 }
 
+const DIFF_PREVIEW_MAX: u64 = 512 * 1024;
+
 pub fn diff_file(ctx: &Ctx, repo: &Path, path: &str, untracked: bool) -> Result<String> {
+    if crate::safety::looks_secret(path) {
+        return Ok("(contents hidden: this file name usually holds a secret, such as a private key or .env file. \
+It should not be committed. Move it out of the repository or add it to .gitignore.)".into());
+    }
     if untracked {
-        let content = std::fs::read_to_string(repo.join(path)).unwrap_or_else(|_| "(binary file)".into());
+        let full = crate::safety::repo_path(repo, path)?;
+        let meta = std::fs::metadata(&full)?;
+        if meta.is_dir() {
+            return Ok("(folder)".into());
+        }
+        if meta.len() > DIFF_PREVIEW_MAX {
+            return Ok(format!("(new file, {} KB: too large to preview)", meta.len() / 1024));
+        }
+        let bytes = std::fs::read(&full)?;
+        if bytes.contains(&0) {
+            return Ok(format!("(new binary file, {} bytes)", bytes.len()));
+        }
+        let content = String::from_utf8_lossy(&bytes);
         return Ok(content.lines().map(|l| format!("+{l}")).collect::<Vec<_>>().join("\n"));
     }
     read(ctx, repo, &["diff", "HEAD", "--", path])
@@ -178,7 +195,12 @@ pub fn commits_since(ctx: &Ctx, repo: &Path, from: Option<&str>) -> Result<Vec<R
         Ok(o) => o,
         Err(_) => return Ok(vec![]), // empty repo
     };
-    Ok(out
+    Ok(parse_log(&out))
+}
+
+/// Parse `git log --format=%H%x1f%an%x1f%s%x1f%b%x1e` output.
+pub fn parse_log(out: &str) -> Vec<RawCommit> {
+    out
         .split('\x1e')
         .filter(|r| !r.trim().is_empty())
         .map(|r| {
@@ -190,7 +212,7 @@ pub fn commits_since(ctx: &Ctx, repo: &Path, from: Option<&str>) -> Result<Vec<R
                 body: f.get(3).unwrap_or(&"").trim().to_string(),
             }
         })
-        .collect())
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,8 +224,23 @@ pub struct RawCommit {
 }
 
 pub fn stage(ctx: &Ctx, repo: &Path, files: &[String]) -> Result<()> {
+    stage_checked(ctx, repo, files, false)
+}
+
+/// Stage files. Secret-looking files are refused unless `allow_secrets`.
+pub fn stage_checked(ctx: &Ctx, repo: &Path, files: &[String], allow_secrets: bool) -> Result<()> {
     if files.is_empty() {
         return Err(Error::Git("no files selected".into()));
+    }
+    for f in files {
+        crate::safety::repo_path(repo, f)?;
+    }
+    let secrets: Vec<&String> = files.iter().filter(|f| crate::safety::looks_secret(f)).collect();
+    if !secrets.is_empty() && !allow_secrets {
+        return Err(Error::Blocked(format!(
+            "refusing to commit files that look like secrets: {}",
+            secrets.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        )));
     }
     let mut args = vec!["add", "-A", "--"];
     args.extend(files.iter().map(|s| s.as_str()));
@@ -218,7 +255,8 @@ pub fn commit(ctx: &Ctx, repo: &Path, message: &str) -> Result<()> {
     let mut tmp = tempfile::NamedTempFile::new()?;
     std::io::Write::write_all(&mut tmp, message.as_bytes())?;
     let p = tmp.path().to_string_lossy().to_string();
-    write(ctx, repo, &["commit", "-F", &p])?;
+    // whitespace cleanup keeps lines starting with "#" (markdown headings, "#12 fixed").
+    write(ctx, repo, &["commit", "--cleanup=whitespace", "-F", &p])?;
     Ok(())
 }
 
@@ -226,11 +264,13 @@ pub fn annotated_tag(ctx: &Ctx, repo: &Path, tag: &str, message: &str) -> Result
     let mut tmp = tempfile::NamedTempFile::new()?;
     std::io::Write::write_all(&mut tmp, message.as_bytes())?;
     let p = tmp.path().to_string_lossy().to_string();
-    write(ctx, repo, &["tag", "-a", tag, "-F", &p])?;
+    crate::safety::git_ref(tag)?;
+    write(ctx, repo, &["tag", "-a", "--cleanup=whitespace", tag, "-F", &p])?;
     Ok(())
 }
 
 pub fn push(ctx: &Ctx, repo: &Path, refspec: &str) -> Result<()> {
+    crate::safety::git_ref(refspec)?;
     write(ctx, repo, &["push", "origin", refspec])?;
     Ok(())
 }
@@ -258,11 +298,14 @@ pub fn fetch(ctx: &Ctx, repo: &Path) -> Result<()> {
 }
 
 pub fn checkout(ctx: &Ctx, repo: &Path, branch: &str) -> Result<()> {
-    write(ctx, repo, &["checkout", branch])?;
+    crate::safety::git_ref(branch)?;
+    // Trailing "--" makes git read `branch` as a branch, never as a path.
+    write(ctx, repo, &["checkout", branch, "--"])?;
     Ok(())
 }
 
 pub fn merge_ff_only(ctx: &Ctx, repo: &Path, rev: &str) -> Result<()> {
+    crate::safety::git_ref(rev)?;
     write(ctx, repo, &["merge", "--ff-only", rev])?;
     Ok(())
 }

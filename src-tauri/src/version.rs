@@ -95,12 +95,12 @@ fn parse_ver(s: &str) -> Result<Version> {
     Version::parse(t).map_err(|e| Error::Version(format!("'{t}' is not semver: {e}")))
 }
 
-fn rel(repo: &Path, f: &str) -> PathBuf {
-    repo.join(f)
+fn rel(repo: &Path, f: &str) -> Result<PathBuf> {
+    crate::safety::repo_path(repo, f)
 }
 
 fn read_file(repo: &Path, f: &str) -> Result<String> {
-    std::fs::read_to_string(rel(repo, f)).map_err(|e| Error::Version(format!("read {f}: {e}")))
+    std::fs::read_to_string(rel(repo, f)?).map_err(|e| Error::Version(format!("read {f}: {e}")))
 }
 
 /// `"version": "x"` as the first top-level occurrence; edits preserve formatting.
@@ -322,8 +322,9 @@ fn replace_first(re: &Regex, text: &str, nv: &str, f: &str) -> Result<String> {
 /// Write planned edits (skipped in dry-run). Returns changed paths.
 pub fn apply_edits(ctx: &Ctx, repo: &Path, edits: &[FileEdit]) -> Result<Vec<String>> {
     for e in edits {
+        let path = rel(repo, &e.path)?;
         if ctx.side_effect(&format!("write {}", e.path)) {
-            std::fs::write(rel(repo, &e.path), &e.content)?;
+            std::fs::write(path, &e.content)?;
         }
     }
     Ok(edits.iter().map(|e| e.path.clone()).collect())

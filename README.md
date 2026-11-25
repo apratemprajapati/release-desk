@@ -93,6 +93,14 @@ Set these per project under **Edit project**:
 - **No force**: the git wrapper panics on `--force`/`-f`.
 - **Tokens**: OS keychain only. All logs, errors and audit records go through
   `redact::redact` (token patterns plus the exact token in use).
+- **Secrets**: new untracked files start unticked. Files that look like keys, certificates or
+  `.env` files are hidden in the diff view, and committing one needs an explicit confirmation
+  (the backend refuses it otherwise).
+- **Untrusted repo config**: `release-desk.json` cannot point version files or the changelog
+  outside the repo, set the runner folder, pass a workflow path, or use branch or tag names
+  that git would read as options. Owner, repo and tag names are validated before they go into
+  GitHub API URLs. Artifact zips are capped at 1000 entries and 2 GiB.
+- **Runners** started from the app are stopped when the app quits.
 - **Idempotent**: tag step skips commit/tag if the tag exists; release step reuses an
   existing release for the tag.
 
